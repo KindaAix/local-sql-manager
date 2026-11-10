@@ -101,6 +101,8 @@ $NuitkaArgs = @(
     "--assume-yes-for-downloads",
     "--include-data-dir=local_sql_manager/templates=local_sql_manager/templates",
     "--include-data-dir=local_sql_manager/static=local_sql_manager/static",
+    # uvicorn 用 import_from_string 动态加载协议/事件循环/lifespan，静态分析抓不到。
+    "--include-package=uvicorn",
     "--windows-icon-from-ico=packaging/app.ico",
     "--product-name=本地多维表格",
     "--file-version=$Version",
