@@ -1,0 +1,35 @@
+# codebuddy md
+CODEBUDDY.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# virtualenv / uv
+.venv/
+venv/
+.env
+.env.*
+uv.lock
+
+# test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
