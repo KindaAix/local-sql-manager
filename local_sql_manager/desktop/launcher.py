@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import logging
 import os
 import socket
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
+from functools import partial
 from pathlib import Path
 
 from flask import Flask
@@ -126,14 +129,91 @@ def library_path(config: dict) -> str:
     return str(Path(config["libraries_dir"]) / "我的数据.sqlite")
 
 
+class McpHandle:
+    """MCP 服务的句柄：保存 uvicorn 服务与线程，负责停止并暴露实际端口。"""
+
+    def __init__(self, server, thread: threading.Thread, port: int):
+        self.server = server
+        self.thread = thread
+        self.port = port
+
+    def stop(self) -> None:
+        """通知 uvicorn 退出并等待线程结束；重复调用无害。"""
+        self.server.should_exit = True
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
+
+
 def start_mcp(library: Library, *, port: int, read_only: bool):
-    """可选钩子：Task 22 接入 FastMCP。当前不启动任何 MCP 服务。"""
-    return None
+    """在 daemon 线程里跑 FastMCP 的 streamable-http 服务。
+
+    返回 McpHandle；依赖缺失或启动失败时记日志并返回 None，不阻断桌面壳。
+    """
+    try:
+        import uvicorn
+
+        from local_sql_manager.mcp_server import build_mcp
+
+        mcp = build_mcp(library, read_only=read_only)
+        app = mcp.http_app(path="/mcp")
+        # 配置端口被占用时改用系统分配的空闲端口：托盘复制出的配置会用
+        # 实际端口，因此 agent 仍然连得上。
+        listen_port = pick_port(port)
+        config = uvicorn.Config(
+            app,
+            host=HOST,
+            port=listen_port,
+            log_level="warning",
+            lifespan="on",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        thread = threading.Thread(
+            target=server.run, name="lsm-mcp", daemon=True
+        )
+        thread.start()
+        # 启动失败时线程会提前退出，这里短暂等待以便把失败暴露成 None。
+        deadline = time.monotonic() + 2
+        while thread.is_alive() and not server.started:
+            if time.monotonic() >= deadline:
+                break
+            thread.join(timeout=0.02)
+        if not server.started:
+            server.should_exit = True
+            raise RuntimeError(f"MCP 服务未能启动（端口 {listen_port}）")
+        actual = listen_port
+        try:
+            actual = server.servers[0].sockets[0].getsockname()[1]
+        except (AttributeError, IndexError, OSError):
+            logger.debug("无法读取 MCP 实际端口，沿用配置端口 %s", port)
+        logger.info("MCP 服务已启动：http://%s:%s/mcp", HOST, actual)
+        return McpHandle(server, thread, int(actual))
+    except Exception:
+        logger.exception("MCP 服务启动失败，界面继续运行")
+        return None
 
 
-def mcp_config_text() -> str | None:
-    """可选钩子：Task 22 返回可直接粘贴的 MCP 配置 JSON。"""
-    return None
+def mcp_config_text(port=None) -> str | None:
+    """返回可直接粘贴进 MCP 客户端配置的 JSON；端口无效时返回 None。"""
+    if isinstance(port, bool):
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < port <= 65535:
+        return None
+    return json.dumps(
+        {
+            "mcpServers": {
+                "local-sql-manager": {
+                    "url": f"http://{HOST}:{port}/mcp",
+                }
+            }
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 def open_browser(url: str) -> None:
@@ -207,7 +287,9 @@ def main() -> int:
             port=int(config["mcp_port"]),
             read_only=bool(config["mcp_read_only"]),
         )
-        mcp_config = mcp_config_text if mcp is not None else None
+        mcp_config = (
+            partial(mcp_config_text, mcp.port) if mcp is not None else None
+        )
         open_browser(url)
 
         def shutdown() -> None:
