@@ -27,6 +27,19 @@ class TestAudit(unittest.TestCase):
         self.assertEqual(row["irreversible"], 0)
         self.assertIsNone(row["undone_by"])
         self.assertRegex(row["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual(
+            set(row),
+            {
+                "id",
+                "ts",
+                "source",
+                "kind",
+                "table",
+                "payload",
+                "undone_by",
+                "irreversible",
+            },
+        )
 
     def test_payload_stored_as_json_text(self):
         op = audit.record(

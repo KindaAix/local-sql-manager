@@ -20,14 +20,12 @@ _SELECT = (
 
 
 def _to_dict(row: tuple) -> dict:
-    # "table" 与 "table_name" 同值：前者对齐 record 的参数名，后者对齐表列名。
     return {
         "id": row[0],
         "ts": row[1],
         "source": row[2],
         "kind": row[3],
         "table": row[4],
-        "table_name": row[4],
         "payload": json.loads(row[5]) if row[5] is not None else {},
         "undone_by": row[6],
         "irreversible": row[7],
