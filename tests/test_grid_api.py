@@ -4,6 +4,7 @@
 """
 
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -71,6 +72,24 @@ class GridApiTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def scalar(self, sql: str, params=()):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(sql, params).fetchone()[0]
+        finally:
+            conn.close()
+
+    def cell_texts(self, html: str, row_id: str) -> list:
+        """取某行所有 td.cell 的纯文本，用于比对页面与 API 片段。"""
+        pattern = (
+            r'<tr class="grid-row" data-id="%s"[^>]*>(.*?)</tr>'
+            % re.escape(row_id)
+        )
+        found = re.search(pattern, html, re.S)
+        self.assertIsNotNone(found, f"找不到第 {row_id} 行的片段")
+        cells = re.findall(r'<td class="cell"[^>]*>(.*?)</td>', found.group(1), re.S)
+        return [re.sub(r"<[^>]+>", "", cell).strip() for cell in cells]
+
     def version(self, row_id: int) -> str:
         row = self.row(row_id)
         self.assertIsNotNone(row, f"第 {row_id} 行应存在")
@@ -90,9 +109,9 @@ class GridApiTest(unittest.TestCase):
         html = self.client.get("/t/订单/").get_data(as_text=True)
         self.assertIn("/static/js/grid.js", html)
         self.assertIn('data-col="单号"', html)
-        self.assertIn('data-updated-at="', html)
-        # 版本值做了 URL 编码，源码里不应出现裸的 UTC ISO 串。
-        self.assertNotIn("2026-01-01T00:00:00Z", html)
+        match = re.search(r'data-id="1" data-updated-at="([^"]*)"', html)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), self.row(1)["updated_at"])
 
         script = self.client.get("/static/js/grid.js")
         self.assertEqual(script.status_code, 200)
@@ -101,7 +120,8 @@ class GridApiTest(unittest.TestCase):
     # --- 保存 ---------------------------------------------------------
 
     def test_save_updates_cell_and_returns_row_fragment(self):
-        response = self.save({"1": {"单号": "SO-NEW"}}, {"1": self.version(1)})
+        before = self.version(1)
+        response = self.save({"1": {"单号": "SO-NEW"}}, {"1": before})
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.mimetype.startswith("text/html"))
@@ -110,10 +130,15 @@ class GridApiTest(unittest.TestCase):
         self.assertIn('data-col="单号"', html)
         self.assertIn("SO-NEW", html)
         self.assertNotIn("SO-2026-0148", html)
-        self.assertNotIn("2026-01-01T00:00:00Z", html)
+        # 片段里带的就是更新后的版本号，下一次保存直接回传。
+        match = re.search(r'data-id="1" data-updated-at="([^"]*)"', html)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), self.row(1)["updated_at"])
+        # 片段里返回的版本号可以直接用于下一次保存。
+        follow_up = self.save({"1": {"状态": "待付款"}}, {"1": match.group(1)})
+        self.assertEqual(follow_up.status_code, 200)
 
         self.assertEqual(self.row(1)["单号"], "SO-NEW")
-        self.assertGreater(self.row(1)["updated_at"], "2020")
 
         history = audit.history(self.library.conn, "订单", limit=1)
         self.assertEqual(history[0]["kind"], "update")
@@ -176,6 +201,31 @@ class GridApiTest(unittest.TestCase):
         self.assertNotIn('data-col="状态"', html)
         self.assertEqual(self.row(1)["金额"], 521)
 
+    def test_save_fragment_cell_texts_match_page(self):
+        view_id = views.create_view(
+            self.library.conn,
+            "订单",
+            "对照",
+            {"order": ["金额", "单号"], "hidden": ["状态"]},
+        )
+        self.library.conn.commit()
+
+        page = self.client.get(f"/t/订单/?view={view_id}").get_data(as_text=True)
+        response = self.client.post(
+            f"/api/t/订单/save?view={view_id}",
+            json={
+                "changes": {"1": {"金额": 520.5}},
+                "expected": {"1": self.version(1)},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        page_cells = self.cell_texts(page, "1")
+        fragment_cells = self.cell_texts(response.get_data(as_text=True), "1")
+        # 除了刚改的金额，其它单元格的文本（含辅助列本地时间）必须完全一致。
+        self.assertEqual(fragment_cells[0], "520.5")
+        self.assertEqual(fragment_cells[1:], page_cells[1:])
+
     def test_save_partial_conflict_rolls_back_whole_batch(self):
         ops_before = self.op_count()
         response = self.save(
@@ -229,6 +279,27 @@ class GridApiTest(unittest.TestCase):
         self.assertEqual(self.row(1)["单号"], "SO-2026-0148")
         self.assertEqual(self.op_count(), ops_before)
 
+    def test_request_body_matrix(self):
+        # 空 body：Content-Type 是 JSON 但解析不出对象。
+        empty = self.client.post(
+            "/api/t/订单/save", data="", content_type="application/json"
+        )
+        self.assertEqual(empty.status_code, 400)
+
+        # 畸形 JSON。
+        broken = self.client.post(
+            "/api/t/订单/save", data="{bad", content_type="application/json"
+        )
+        self.assertEqual(broken.status_code, 400)
+
+        # 只有 POST 才允许。
+        self.assertEqual(self.client.get("/api/t/订单/save").status_code, 405)
+
+        # ids 不是数组。
+        ids_shape = self.post("/api/t/订单/delete", {"ids": "1"})
+        self.assertEqual(ids_shape.status_code, 400)
+        self.assertIn("ids 必须是数组", ids_shape.get_json()["error"])
+
     def test_save_rejects_non_json_request(self):
         response = self.client.post(
             "/api/t/订单/save", data="{}", content_type="text/plain"
@@ -261,6 +332,27 @@ class GridApiTest(unittest.TestCase):
         self.assertEqual(history[0]["kind"], "insert")
         self.assertEqual(history[0]["source"], "web")
 
+    def test_insert_not_null_violation_is_readable_400(self):
+        self.library.conn.execute(
+            'CREATE TABLE "严格" ("编号" TEXT NOT NULL, "created_at" TEXT,'
+            ' "updated_at" TEXT, "deleted_at" TEXT)'
+        )
+        self.library.conn.execute(
+            'INSERT INTO "__lsm_table" ("table_name", "status", "created_at")'
+            " VALUES (?, ?, ?)",
+            ("严格", "active", "2026-01-01T00:00:00Z"),
+        )
+        self.library.conn.commit()
+        ops_before = self.op_count()
+
+        response = self.post("/api/t/严格/insert", {"values": {}})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("编号", response.get_json()["error"])
+        self.assertIn("不能为空", response.get_json()["error"])
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM "严格"'), 0)
+        self.assertEqual(self.op_count(), ops_before)
+
     def test_insert_allows_empty_values(self):
         response = self.post("/api/t/订单/insert", {"values": {}})
         self.assertEqual(response.status_code, 200)
@@ -287,6 +379,23 @@ class GridApiTest(unittest.TestCase):
         self.assertIsNone(self.row(1)["deleted_at"])
         self.assertIsNone(self.row(2)["deleted_at"])
         self.assertEqual(self.row(1)["单号"], "SO-2026-0148")
+
+    def test_delete_rejects_invalid_id_elements(self):
+        ops_before = self.op_count()
+        for bad in ([{}], [True], [1.5], [None], ["ok", {}]):
+            response = self.post("/api/t/订单/delete", {"ids": bad})
+            self.assertEqual(response.status_code, 400, bad)
+            self.assertEqual(
+                response.get_json()["error"], "行 id 必须是整数或字符串"
+            )
+        self.assertEqual(self.op_count(), ops_before)
+        self.assertIsNone(self.row(1)["deleted_at"])
+
+    def test_delete_accepts_string_ids(self):
+        response = self.post("/api/t/订单/delete", {"ids": ["1"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["deleted"], 1)
+        self.assertIsNotNone(self.row(1)["deleted_at"])
 
     def test_delete_requires_ids(self):
         response = self.post("/api/t/订单/delete", {"ids": []})
@@ -316,6 +425,34 @@ class GridApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 404)
         self.assertIn("表不存在", response.get_json()["error"])
+
+    def test_unmanaged_table_save_is_403(self):
+        self.library.conn.execute('CREATE TABLE "外部" ("编号" TEXT)')
+        self.library.conn.execute('INSERT INTO "外部" ("编号") VALUES (?)', ("X",))
+        self.library.conn.commit()
+        ops_before = self.op_count()
+
+        response = self.post(
+            "/api/t/外部/save",
+            {"changes": {"1": {"编号": "Y"}}, "expected": {"1": "v"}},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["error"], "该表未启用编辑，请先启用编辑")
+        self.assertEqual(self.scalar('SELECT "编号" FROM "外部"'), "X")
+        self.assertEqual(self.op_count(), ops_before)
+
+    def test_unmanaged_table_insert_is_403_and_writes_nothing(self):
+        self.library.conn.execute('CREATE TABLE "外部二" ("编号" TEXT)')
+        self.library.conn.commit()
+        ops_before = self.op_count()
+
+        response = self.post("/api/t/外部二/insert", {"values": {}})
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["error"], "该表未启用编辑，请先启用编辑")
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM "外部二"'), 0)
+        self.assertEqual(self.op_count(), ops_before)
 
     def test_internal_table_is_404(self):
         response = self.post(
@@ -352,12 +489,60 @@ class GridApiTest(unittest.TestCase):
         self.assertEqual(config.widths.get("单号"), 180)
         self.assertEqual(config.widths.get("金额"), 260)
 
+    def test_view_config_preserves_other_fields(self):
+        filters = [{"column": "状态", "op": "eq", "value": "已发货"}]
+        sorts = [{"column": "金额", "desc": True}]
+        hidden = ["状态"]
+        group = {"column": "状态"}
+        aggregates = [{"column": "金额", "fn": "sum"}]
+        view_id = views.create_view(
+            self.library.conn,
+            "订单",
+            "综合配置",
+            {
+                "filters": filters,
+                "sorts": sorts,
+                "hidden": hidden,
+                "group": group,
+                "aggregates": aggregates,
+                "widths": {"单号": 180},
+                "order": ["单号"],
+            },
+        )
+        self.library.conn.commit()
+
+        response = self.post(
+            f"/api/views/{view_id}/config",
+            {"widths": {"金额": 200}, "order": ["金额", "单号"]},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        config = views.load_config(self.library.conn, view_id)
+        self.assertEqual(config.filters, filters)
+        self.assertEqual(config.sorts, sorts)
+        self.assertEqual(config.hidden, hidden)
+        self.assertEqual(config.group, group)
+        self.assertEqual(config.aggregates, aggregates)
+        self.assertEqual(config.widths.get("单号"), 180)
+        self.assertEqual(config.widths.get("金额"), 200)
+        self.assertEqual(config.order, ["金额", "单号"])
+
     def test_view_config_unknown_view_is_404(self):
         response = self.post(
             "/api/views/9999/config", {"widths": {"单号": 200}}
         )
         self.assertEqual(response.status_code, 404)
         self.assertIn("视图不存在", response.get_json()["error"])
+
+    def test_view_config_checks_view_before_payload(self):
+        # 视图不存在优先于列宽校验；默认视图优先于一切。
+        missing = self.post("/api/views/9999/config", {"widths": {"单号": 10}})
+        self.assertEqual(missing.status_code, 404)
+        self.assertIn("视图不存在", missing.get_json()["error"])
+
+        default = self.post("/api/views/0/config", {"widths": {"单号": 10}})
+        self.assertEqual(default.status_code, 400)
+        self.assertIn("默认视图", default.get_json()["error"])
 
     def test_view_config_default_view_is_400(self):
         response = self.post("/api/views/0/config", {"widths": {"单号": 200}})

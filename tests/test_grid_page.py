@@ -315,7 +315,8 @@ class GridPageTest(unittest.TestCase):
             "%Y-%m-%d %H:%M"
         )
         self.assertIn(expected, html)
-        self.assertNotIn("2026-01-01T00:00:00Z", html)
+        # 原始 UTC 值只出现在 data-updated-at 属性里，单元格文本必须是本地时间。
+        self.assertNotIn(">2026-01-01T00:00:00Z<", html)
 
     def test_special_characters_are_escaped(self):
         nasty = '<script>&"\''

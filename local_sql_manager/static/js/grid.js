@@ -1,8 +1,8 @@
 /* 网格交互：选中、编辑、粘贴、批量删除、新增行、列宽与列序拖拽。
  *
  * 原生 JS，无框架、无构建、无外部依赖。所有写请求都走 /api 下的 JSON 接口，
- * 服务层保证一次请求 = 一条可撤销操作；乐观锁版本取自行的 data-updated-at
- * （服务端做了 URL 编码，这里解码后原样回传）。
+ * 服务层保证一次请求 = 一条可撤销操作；乐观锁版本取自行的 data-updated-at，
+ * 编辑成功后用返回片段中的新值继续下一次保存。
  */
 (function () {
   "use strict";
@@ -331,9 +331,7 @@
         missing = true;
         return;
       }
-      var version = tr.dataset.updatedAt
-        ? decodeURIComponent(tr.dataset.updatedAt)
-        : "";
+      var version = tr.dataset.updatedAt || "";
       if (!version) {
         missing = true;
         return;

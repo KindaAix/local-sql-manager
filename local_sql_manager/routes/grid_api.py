@@ -68,6 +68,19 @@ def _require_table(conn: sqlite3.Connection, table: str) -> None:
         raise _ApiError(f"表不存在：{table}", 404)
 
 
+def _require_managed(conn: sqlite3.Connection, table: str) -> None:
+    """只有登记在 __lsm_table 且状态为 active 的表才允许写入。
+
+    未登记的外部表虽然出现在 list_tables 里，但没有字段元数据、视图与
+    回收站语义，写入会留下审计/回收站都看不见的孤儿数据，所以直接拒绝。
+    """
+    row = conn.execute(
+        'SELECT "status" FROM "__lsm_table" WHERE "table_name" = ?', (table,)
+    ).fetchone()
+    if row is None or row[0] != "active":
+        raise _ApiError("该表未启用编辑，请先启用编辑", 403)
+
+
 def _physical_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     cursor = conn.execute(f"PRAGMA table_info({_quote(table)})")
     return [row[1] for row in cursor.fetchall()]
@@ -129,6 +142,18 @@ def _safe_value(value: object):
 
 def _conflict_row(row: dict) -> dict:
     return {key: _safe_value(value) for key, value in (row or {}).items()}
+
+
+def _integrity_message(exc: sqlite3.IntegrityError) -> str:
+    """把 SQLite 的约束错误换成带列名的中文提示。"""
+    raw = str(exc)
+    detail = raw.split(":", 1)[1].strip() if ":" in raw else ""
+    column = detail.rsplit(".", 1)[-1].strip() if "." in detail else ""
+    if "NOT NULL" in raw and column:
+        return f"「{column}」不能为空"
+    if "UNIQUE" in raw and column:
+        return f"「{column}」已存在重复值"
+    return "数据不满足约束，请检查必填项与唯一值"
 
 
 def _friendly_message(message: str) -> str:
@@ -199,6 +224,7 @@ def save_cells(table: str):
     def write(conn):
         body = _json_body()
         _require_table(conn, table)
+        _require_managed(conn, table)
         changes = body.get("changes")
         expected = body.get("expected")
         if not isinstance(changes, dict) or not changes:
@@ -230,12 +256,16 @@ def insert_row(table: str):
     def write(conn):
         body = _json_body()
         _require_table(conn, table)
+        _require_managed(conn, table)
         values = body.get("values", {})
         if values is None:
             values = {}
         if not isinstance(values, dict):
             raise _ApiError("values 必须是 {列: 值} 对象")
-        op = rows.insert_rows(conn, table, [values], source="web")
+        try:
+            op = rows.insert_rows(conn, table, [values], source="web")
+        except sqlite3.IntegrityError as exc:
+            raise _ApiError(_integrity_message(exc)) from exc
         if op is None:
             raise _ApiError("没有可新增的内容")
         record = audit.get_op(conn, op)
@@ -257,11 +287,15 @@ def delete_rows(table: str):
     def write(conn):
         body = _json_body()
         _require_table(conn, table)
+        _require_managed(conn, table)
         ids = body.get("ids")
         if not isinstance(ids, list):
             raise _ApiError("ids 必须是数组")
         if not ids:
             raise _ApiError("没有选择要删除的行")
+        for value in ids:
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                raise _ApiError("行 id 必须是整数或字符串")
         op = rows.soft_delete(conn, table, ids, source="web")
         if op is None:
             return {"op": None, "deleted": 0}
@@ -324,9 +358,11 @@ def save_view_config(view_id: int):
         body = _json_body()
         if view_id == 0:
             raise _ApiError("默认视图不能保存列配置，请先新建视图")
+        if views._fetch(conn, view_id) is None:
+            raise _ApiError("视图不存在", 404)
+        current = views.load_config(conn, view_id)
         widths = _normalize_widths(body.get("widths"))
         order = _normalize_order(body.get("order"))
-        current = views.load_config(conn, view_id)
         merged_widths = dict(current.widths or {})
         merged_widths.update(widths)
         config = ViewConfig(

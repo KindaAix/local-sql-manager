@@ -8,7 +8,7 @@
 {{ row.get(column.name) | cell }}
 {%- endif -%}
 {%- endmacro -%}
-<tr class="grid-row" data-id="{{ row.get('id', '') }}" data-updated-at="{{ (row.get('updated_at') or '') | urlencode }}">
+<tr class="grid-row" data-id="{{ row.get('id', '') }}" data-updated-at="{{ row.get('updated_at') or '' }}">
   {% for column in columns %}
   <td class="cell" data-col="{{ column.name }}" data-type="{{ column.type }}"{% if column.type == 'local_time' %} data-readonly="1"{% endif %}>{{ cell_text(row, column) }}</td>
   {% endfor %}
