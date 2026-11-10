@@ -130,13 +130,14 @@ class TestExport(BaseShareTestCase):
         self.assertRegex(manifest["exported_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertEqual(manifest["tables"], [{"name": "订单", "row_count": 2}])
 
-    def test_export_omits_audit_history(self):
+    def test_export_keeps_audit_and_trash(self):
+        """分享包是完整状态：审计与删列回收表跟着走。"""
         out = self.export()
         with zipfile.ZipFile(out) as zf:
             zf.extract("db.sqlite", self.dir / "peek")
         lib = self.open_imported(self.dir / "peek" / "db.sqlite")
         self.assertEqual(
-            lib.conn.execute('SELECT COUNT(*) FROM "__lsm_op"').fetchone()[0], 0
+            lib.conn.execute('SELECT COUNT(*) FROM "__lsm_op"').fetchone()[0], 1
         )
         self.assertEqual(
             lib.conn.execute('SELECT COUNT(*) FROM "__lsm_trash_col"').fetchone()[0], 0
@@ -176,7 +177,18 @@ class TestImportRoundTrip(BaseShareTestCase):
         self.assertTrue(Path(dest).exists())
         lib = self.open_imported(dest)
         self.assertEqual(
-            lib.conn.execute('SELECT COUNT(*) FROM "__lsm_op"').fetchone()[0], 0
+            lib.conn.execute('SELECT COUNT(*) FROM "__lsm_op"').fetchone()[0],
+            self.lib.conn.execute('SELECT COUNT(*) FROM "__lsm_op"').fetchone()[0],
+        )
+        self.assertEqual(
+            lib.conn.execute('SELECT COUNT(*) FROM "__lsm_table"').fetchone()[0], 1
+        )
+        self.assertEqual(
+            lib.conn.execute(
+                'SELECT COUNT(*) FROM sqlite_master '
+                "WHERE type='table' AND name='__lsm_view'"
+            ).fetchone()[0],
+            1,
         )
         self.assertEqual(
             lib.conn.execute('SELECT COUNT(*) FROM "订单"').fetchone()[0], 2

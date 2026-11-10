@@ -32,9 +32,6 @@ MAX_COMPRESSION_RATIO = 200
 # 而这么小的包本身没有危害。
 _RATIO_CHECK_MIN_BYTES = 16 * 1024 * 1024
 
-# 本地操作历史不入包：接收方的撤销栈与他人的操作记录无关。
-_HISTORY_TABLES = ("__lsm_op", "__lsm_trash_col")
-
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
 _COPY_CHUNK = 1024 * 1024
@@ -42,13 +39,6 @@ _COPY_CHUNK = 1024 * 1024
 
 def _quote(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
-
-
-def _has_table(conn: sqlite3.Connection, name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone()
-    return row is not None
 
 
 def _table_summary(conn: sqlite3.Connection) -> list:
@@ -71,7 +61,8 @@ def export_lsmf(conn: sqlite3.Connection, db_path, out_path, app_version: str):
     """把库打成分享包，返回包路径。
 
     `conn` 用 SQLite 的 backup 接口复制出一致快照，因此即使库处于 WAL 模式也不用
-    手工拷贝文件；源库完全不受影响。
+    手工拷贝文件；源库完全不受影响。审计与回收站属于库的完整状态的一部分，一并入包，
+    接收方才能看到改动的来龙去脉。
     """
     out = Path(out_path) if out_path is not None else Path(db_path).with_suffix(".lsmf")
     if out.resolve() == Path(db_path).resolve():
@@ -83,10 +74,6 @@ def export_lsmf(conn: sqlite3.Connection, db_path, out_path, app_version: str):
         copy = sqlite3.connect(str(snapshot))
         try:
             conn.backup(copy)
-            for table in _HISTORY_TABLES:
-                if _has_table(copy, table):
-                    copy.execute(f"DELETE FROM {_quote(table)}")
-            copy.commit()
             manifest = {
                 "format": FORMAT_VERSION,
                 "app_version": app_version,
