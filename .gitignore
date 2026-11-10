@@ -36,3 +36,6 @@ Thumbs.db
 
 # brainstorming mockups
 .superpowers/
+
+# parallel worktrees
+.worktrees/

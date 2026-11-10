@@ -36,39 +36,63 @@
 
 **规模判断：** 25 个任务、约 6 个模块；核心依赖是 `services/models.py` 的签名。按 4 条流 + 1 名集成人拆，瓶颈在波次 0 之后的数据层。
 
-### 波次与依赖
+### 分层并行（v2）
+
+按依赖切成 8 层，层内并行、层间串行；每层合并后打 tag，下一层从 tag 拉 worktree。
 
 ```
-波次 0（1 人，串行，阻塞全部）
-  Task 1 骨架 → Task 2 模型 → Task 3 库/元数据 → Task 4 类型
-  产出即契约：models.py 的 dataclass 与各 services 的签名，冻结后任何改动必须通知全队
-
-波次 1（4 条流并行）
-  S1 数据核心   Task 5 建表 → 6 查询 → 7 分页 → 9 审计 → 8 写入/冲突
-  S2 历史与结构 Task 10 撤销（依赖 8/9）→ 11 视图（依赖 5）→ 12 字段 → 13 表级 → 14 外部表
-  S3 文件 IO    Task 15 导入（依赖 5/12）→ 16 导出（依赖 7/11）→ 17 lsmf（独立）→ 18 合并（依赖 5/9/10）
-  S4 界面       Task 19 网格页（依赖 7/11）→ 20 写入 API + JS（依赖 8/9）→ 21 向导/面板/历史（依赖 15/11/10）
-
-波次 2（与波次 1 尾部并行）
-  Task 22 MCP（依赖 S1 全部 + S2 的 11/10）
-  Task 23 桌面壳（只依赖 Task 1，可从波次 1 一开始就并行）
-
-波次 3（串行）
-  Task 24 打包（需要 22/23 完成）→ Task 25 清理旧代码
+层 0（已完成）  1 骨架 → 2 模型 → 3 库 → 4 类型                    tag contracts-v1
+层 1（4 并行）  A 5 建表 → 6 查询 → 7 分页   B 9 审计   C 23 桌面壳   D 17 lsmf
+层 2（3 并行）  A 8 写入/冲突   B 11 视图   C 13 表级与回收站
+层 3（3 并行）  A 10 撤销   B 14 外部表   C 15 Excel 导入
+层 4（2 并行）  A 12 字段管理   B 16 导出
+层 5（3 并行）  A 18 合并   B 19 网格页   C 22 MCP
+层 6（2 并行）  A 20 写入 API + JS   B 21 导入/导出/分享/视图/历史页
+层 7（串行）    24 打包 → 25 清理
 ```
 
-**任务与流的对应**
+**分层依据（同层文件必须互斥）**
 
-| 流 | 任务 | 负责人产出 |
-|---|---|---|
-| S1 数据核心 | 5, 6, 7, 9, 8 | 全部读写与查询原语，所有流都调它 |
-| S2 历史与结构 | 10, 11, 12, 13, 14 | 撤销、视图、字段、表级、外部表 |
-| S3 文件 IO | 15, 16, 17, 18 | Excel 进出、分享包、合并 |
-| S4 界面 | 19, 20, 21 | 模板、CSS、JS、路由 |
-| 集成 | 1–4 起手，之后负责合并 | 契约、`app.py`、冲突解决 |
-| 支撑 | 22, 23 | MCP 与桌面壳，可提前开工 |
+| 层 | 任务 | 独占文件 | 依赖 |
+|---|---|---|---|
+| 1 | 5, 6, 7 | `services/schema.py`、`query.py`、`rows.py`（只读部分） | 3, 4 |
+| 1 | 9 | `services/audit.py` | 2, 3 |
+| 1 | 23 | `desktop/*`、`pyproject.toml`（入口） | 1 |
+| 1 | 17 | `services/share.py` | 1（只用 zip + sqlite3） |
+| 2 | 8 | `services/rows.py`（写入部分） | 7, 9 |
+| 2 | 11 | `services/views.py` | 5 |
+| 2 | 13 | `services/schema.py`（表级）、`services/undo.py` 注册表接口 | 5, 9 |
+| 3 | 10 | `services/undo.py`（核心 + 行级处理器） | 8 |
+| 3 | 14 | `services/adopt.py` | 5, 8 |
+| 3 | 15 | `services/import_excel.py` | 5, 13 |
+| 4 | 12 | `services/schema.py`（字段级） | 5, 10, 11 |
+| 4 | 16 | `services/export_excel.py` | 7, 11 |
+| 5 | 18 | `services/merge.py`、`services/undo.py`（merge 处理器） | 5, 9, 10 |
+| 5 | 19 | `routes/grid.py`、`templates/*`、`static/css/*` | 7, 11 |
+| 5 | 22 | `mcp_server.py` | 5, 7, 8, 9, 10, 11 |
+| 6 | 20 | `routes/grid_api.py`、`static/js/*` | 8, 9, 19 |
+| 6 | 21 | `routes/import_export.py`、`views.py`、`history.py`、其余模板 | 10, 11, 14, 15, 16, 17, 18 |
+| 7 | 24, 25 | `packaging/*`、删除旧代码 | 全部 |
 
-**关键路径：** 1 → 3 → 5 → 6 → 7 → 19 → 20 → 21 → 24，约 9 个任务；S2/S3 有足够缓冲，不会成为瓶颈。
+**并发上限 4。** 同一层里若两个任务都要改同一个文件，说明分层错了：把其中一个推到下一层，不要靠"先到先得"。
+
+**Worktree 机制**
+
+```bash
+# 每层开工时，每个成员一条独立分支与工作树
+git worktree add .worktrees/L1a -b layer1/t5-7 contracts-v1
+git worktree add .worktrees/L1b -b layer1/audit contracts-v1
+# 成员在自己目录里跑测试，共享同一份 .venv
+cd .worktrees/L1a && D:/Projects/local-sql-manager/.venv/Scripts/python.exe -m unittest discover -s tests -t . -v
+# 合并（按依赖顺序，冲突由集成人解）
+git merge --no-ff layer1/t5-7 && git tag layer-1
+rm -rf .worktrees/L1a && git worktree prune
+```
+
+- `.worktrees/` 加入 `.gitignore`，不提交。
+- 每个成员**只在自己的 worktree 提交**，不碰主工作树。
+- 合并后立刻跑全量测试并打 `layer-N` tag；红则回退该分支，不进入下一层。
+- 静态资源（templates/static）在层 5、6 由不同成员独占，层内不并行改同一模板。
 
 ### 文件归属（避免合并冲突）
 
@@ -80,11 +104,11 @@
 
 ### 合并顺序与门禁
 
-1. 波次 0 合并到主干（`main` 或集成分支），打 tag `contracts-v1`。
-2. 各流从 tag 拉分支 `feat/s1-data`、`feat/s2-history` 等，**先合 S1**（其他流的测试要真跑通得靠它）。
-3. S2、S3、S4 依次合并，每次合并后由集成人跑全量 `python -m unittest discover -s tests -v`；红则不合并。
-4. S4 的 JS 无自动化测试，合并前必须按 Task 20 Step 5 的人工清单走一遍。
-5. 波次 2 的 22/23 在 S1 合并后即可并行开工，不等 S2/S3。
+1. 层 0 已合并到 `feature/sunxd/refactor`，打 tag `contracts-v1`。
+2. 每层开工时从当前 HEAD 拉 worktree 与分支（`git worktree add .worktrees/L2a -b layer2/write HEAD`），成员只在自己 worktree 内提交。
+3. 层内分支按独占文件互斥，合并顺序无所谓；每次合并后跑全量 `python -m unittest discover -s tests -t . -v` 并打 `layer-N` tag。
+4. 冲突由集成人解决；解决后必须重跑全量，红则回退该分支并打回成员。
+5. 层 6 的 Task 20 含前端交互，无自动化测试，合并前按 Task 20 Step 5 的人工清单走一遍。
 
 ### 并行时的纪律
 
