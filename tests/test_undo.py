@@ -76,6 +76,23 @@ class BaseUndoTestCase(unittest.TestCase):
     def count(self, sql, params=()):
         return self.conn.execute(sql, params).fetchone()[0]
 
+    def swap_handler(self, kind, handler):
+        """临时替换某 kind 的处理器，测试结束后恢复原状。
+
+        层 6 起 import/merge/create_field 等已有模块级真实处理器，直接
+        unregister 会把它们永久摘掉、污染后续用例。
+        """
+        previous = undo_service._HANDLERS.get(kind)
+        undo_service.register(kind, handler)
+
+        def restore():
+            if previous is None:
+                undo_service.unregister(kind)
+            else:
+                undo_service.register(kind, previous)
+
+        self.addCleanup(restore)
+
 
 class TestUndoRows(BaseUndoTestCase):
     def test_undo_update_restores_previous_value(self):
@@ -457,18 +474,11 @@ class TestUndoTables(BaseUndoTestCase):
             self.conn, "create_field", "客户", "web", {"column": "备注"}
         )
 
-        undo_service.register(
-            "create_field", lambda conn, op, source: {}
-        )
-        try:
-            with self.assertRaises(StaleOperation):
-                undo_service.undo(self.conn, op)
-        finally:
-            undo_service.unregister("create_field")
-
-        # 处理器移除后，字段操作重新成为可豁免的元数据 op。
-        undo_service.undo(self.conn, op)
-        self.assertNotIn("客户", list_tables(self.conn))
+        # 层 6 起 fields 在服务包导入时就会注册处理器；这里临时覆盖，
+        # 测试结束由 swap_handler 恢复真实处理器。
+        self.swap_handler("create_field", lambda conn, op, source: {})
+        with self.assertRaises(StaleOperation):
+            undo_service.undo(self.conn, op)
 
     def test_undo_rename_table_reverts_name(self):
         op = rename_table(self.conn, "订单", "发票")
@@ -524,14 +534,11 @@ class TestUndoRegistry(BaseUndoTestCase):
         def handler(conn, op, source):
             return {"actions": [undo_service.trash_table(conn, "订单")]}
 
-        undo_service.register("import", handler)
-        try:
-            op = audit.record(
-                self.conn, "import", "订单", "web", {"tables": ["订单"]}
-            )
-            undo_id = undo_service.undo(self.conn, op)
-        finally:
-            undo_service.unregister("import")
+        self.swap_handler("import", handler)
+        op = audit.record(
+            self.conn, "import", "订单", "web", {"tables": ["订单"]}
+        )
+        undo_id = undo_service.undo(self.conn, op)
         record = self.op(undo_id)
         self.assertEqual(record["kind"], "undo")
         self.assertEqual(record["payload"]["op"], op)
@@ -559,12 +566,9 @@ class TestUndoRegistry(BaseUndoTestCase):
                 ]
             }
 
-        undo_service.register("merge", handler)
-        try:
-            op = audit.record(self.conn, "merge", "订单", "web", {})
-            undo_id = undo_service.undo(self.conn, op)
-        finally:
-            undo_service.unregister("merge")
+        self.swap_handler("merge", handler)
+        op = audit.record(self.conn, "merge", "订单", "web", {})
+        undo_id = undo_service.undo(self.conn, op)
         self.assertIn("单据", list_tables(self.conn))
 
         undo_service.undo(self.conn, undo_id)
@@ -582,13 +586,10 @@ class TestUndoRegistry(BaseUndoTestCase):
             calls.append("second")
             return {}
 
-        undo_service.register("merge", first)
+        self.swap_handler("merge", first)
         undo_service.register("merge", second)
-        try:
-            op = audit.record(self.conn, "merge", "订单", "web", {})
-            undo_service.undo(self.conn, op)
-        finally:
-            undo_service.unregister("merge")
+        op = audit.record(self.conn, "merge", "订单", "web", {})
+        undo_service.undo(self.conn, op)
         self.assertEqual(calls, ["second"])
 
 
