@@ -69,6 +69,14 @@ SCHEMA = (
         "value" TEXT
     )
     """,
+    """
+    CREATE INDEX IF NOT EXISTS "__lsm_op_ts"
+    ON "__lsm_op" ("ts", "id")
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS "__lsm_op_table_ts"
+    ON "__lsm_op" ("table_name", "ts", "id")
+    """,
 )
 
 

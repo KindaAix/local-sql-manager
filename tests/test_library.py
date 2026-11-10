@@ -109,6 +109,27 @@ class TestLibrary(unittest.TestCase):
         ensure_meta(lib.conn)
         self.assertEqual(meta_version(lib.conn), META_VERSION)
 
+    def audit_indexes(self, conn):
+        return {
+            row[1]
+            for row in conn.execute('PRAGMA index_list("__lsm_op")')
+        }
+
+    def test_audit_table_indexes(self):
+        lib = self.open()
+        self.assertTrue(
+            {"__lsm_op_ts", "__lsm_op_table_ts"} <= self.audit_indexes(lib.conn)
+        )
+
+    def test_ensure_meta_adds_missing_indexes(self):
+        lib = self.open()
+        lib.conn.execute('DROP INDEX "__lsm_op_ts"')
+        lib.conn.execute('DROP INDEX "__lsm_op_table_ts"')
+        ensure_meta(lib.conn)
+        self.assertTrue(
+            {"__lsm_op_ts", "__lsm_op_table_ts"} <= self.audit_indexes(lib.conn)
+        )
+
     def test_connection_settings(self):
         lib = self.open()
         self.assertEqual(lib.path, self.path)
