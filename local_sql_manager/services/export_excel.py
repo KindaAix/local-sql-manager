@@ -190,13 +190,19 @@ def _cell(worksheet, value):
 
 
 def _csv_cell(value: object) -> str:
-    """CSV 取值：None 写空串；字符串形似公式时前置单引号防注入。"""
+    """CSV 取值：None 写空串；字符串形似公式时前置单引号防注入。
+
+    数字列物理类型是 REAL，整数值按整数文本输出（-5 不写成 -5.0），
+    非整数浮点保持原样。
+    """
     if value is None:
         return ""
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
     if isinstance(value, str) and _CSV_FORMULA_PREFIX.match(value):
         return "'" + value
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value)
 
 

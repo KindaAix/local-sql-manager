@@ -378,7 +378,16 @@ class CsvTest(unittest.TestCase):
         record = dict(zip(data[0], data[1]))
         self.assertEqual(record["名称"], "'=1+1")
         self.assertFalse(record["金额"].startswith("'"))
-        self.assertEqual(float(record["金额"]), -5)
+        self.assertEqual(record["金额"], "-5")
+
+    def test_integral_floats_render_without_decimal_point(self):
+        self.insert("整数", -5, "完成")
+        self.insert("小数", 3.14, "完成")
+        data = self.read(
+            export_csv(self.conn, "订单", ["金额"], Path(self.tmp.name) / "n.csv")
+        )
+        self.assertEqual(data[1], ["-5"])
+        self.assertEqual(data[2], ["3.14"])
 
     def test_all_formula_prefixes_are_quoted(self):
         values = ("+1", "-1", "@SUM(A1)", "\t=1")
