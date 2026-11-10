@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}导入数据 · 本地多维表格管理器{% endblock %}
+{% block body %}
+{% set nav = 'import' %}
+<div class="tool-page">
+  {% include "_tool_nav.html" %}
+  <header class="tool-header">
+    <h1 class="tool-title">导入 Excel / CSV</h1>
+    <p class="tool-text">选择一个 .xlsx 或 .csv 文件，先预览每个工作表的列与推断类型，确认后再建表导入。</p>
+  </header>
+
+  {% if error %}<div class="notice"><p class="notice-text">{{ error }}</p></div>{% endif %}
+
+  <form class="tool-form" method="post" action="{{ url_for('import_export.import_upload') }}" enctype="multipart/form-data">
+    <label class="field">
+      <span class="field-label">选择文件</span>
+      <input class="field-input" type="file" name="file" accept=".xlsx,.csv" required>
+    </label>
+    <p class="form-hint">支持 .xlsx 与 .csv，单个文件不超过 20MB；旧版 .xls 请先在 Excel 中另存为 .xlsx。</p>
+    <button class="button" type="submit">上传并预览</button>
+  </form>
+
+  <section class="tool-section">
+    <h2 class="tool-subtitle">导入分享包</h2>
+    <p class="form-hint">.lsmf 分享包会作为一份新库导入到库目录，不会合并进当前库。</p>
+    <form class="tool-form" method="post" action="{{ url_for('import_export.share_import') }}" enctype="multipart/form-data">
+      <label class="field">
+        <span class="field-label">选择分享包</span>
+        <input class="field-input" type="file" name="file" accept=".lsmf" required>
+      </label>
+      <button class="button button-ghost" type="submit">导入分享包</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

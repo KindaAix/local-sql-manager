@@ -12,7 +12,7 @@
   {% else %}
   <h1 class="standalone-title">这个库里还没有数据表</h1>
   <p class="standalone-text">导入一份 Excel，就能开始整理你的数据。</p>
-  <button class="button" type="button" disabled title="导入向导将在后续版本提供">导入 Excel</button>
+  <a class="button" href="{{ url_for('import_export.import_page') }}">导入 Excel</a>
   {% endif %}
 </div>
 {% else %}
@@ -33,7 +33,14 @@
         {% endif %}
       </div>
       <div class="topbar-actions">
+        {% if table and not error and managed %}
+        <a class="button button-ghost" href="{{ url_for('import_export.export_table', table=table, view=active_view.id, format='xlsx') }}">导出 Excel</a>
+        <a class="button button-ghost" href="{{ url_for('import_export.export_table', table=table, view=active_view.id, format='csv') }}">导出 CSV</a>
+        <a class="button button-ghost" href="{{ url_for('import_export.share_export', table=table) }}">分享</a>
+        <button class="button button-ghost" type="button" id="view-panel-toggle">视图设置</button>
+        {% endif %}
         {% if table and not managed %}<span class="badge badge-readonly" title="未登记受管的表只能查看">只读</span>{% endif %}
+        {% if table and not managed and not error %}<a class="button" href="{{ url_for('tools.adopt_page', table=table) }}">启用编辑</a>{% endif %}
       </div>
     </header>
 
@@ -82,7 +89,9 @@
     </footer>
     {% endif %}
   </div>
+{% if table and not error and managed %}{% include "_view_panel.html" %}{% endif %}
 </div>
 {% endif %}
 {% if table and not error %}<script src="{{ url_for('static', filename='js/grid.js') }}" defer></script>{% endif %}
+{% if table and not error and managed %}<script src="{{ url_for('static', filename='js/views.js') }}" defer></script>{% endif %}
 {% endblock %}

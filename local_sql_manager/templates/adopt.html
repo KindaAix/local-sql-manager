@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}启用编辑 · 本地多维表格管理器{% endblock %}
+{% block body %}
+{% set nav = 'merge' %}
+<div class="tool-page">
+  {% include "_tool_nav.html" %}
+  <header class="tool-header">
+    <h1 class="tool-title">为「{{ table }}」启用编辑</h1>
+    <p class="tool-text">启用后会补上 id 与时间列、登记字段元数据并重建索引，之后就能在网格里编辑。</p>
+  </header>
+
+  {% if ok %}
+  <section class="tool-section">
+    <h2 class="tool-subtitle">将要执行的改动</h2>
+    <ul class="plan-list">
+      {% for step in steps %}<li>{{ step }}</li>{% endfor %}
+    </ul>
+
+    <h3 class="plan-title">现有列</h3>
+    <table class="data-table">
+      <thead><tr><th scope="col">列名</th><th scope="col">类型</th><th scope="col">说明</th></tr></thead>
+      <tbody>
+        {% for column in columns %}
+        <tr>
+          <td>{{ column.name }}</td>
+          <td>{{ column.type }}</td>
+          <td>{% if column.pk %}主键{% elif column.required %}必填{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <form class="tool-actions" method="post" action="{{ url_for('tools.adopt_confirm', table=table) }}">
+      <button class="button" type="submit">确认启用编辑</button>
+    </form>
+  </section>
+  {% else %}
+  <div class="notice notice-error">
+    <p class="notice-text">这张表暂时不能启用编辑：{{ reason }}</p>
+    <a class="button" href="{{ url_for('grid.table_view', table=table) }}">返回表格</a>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

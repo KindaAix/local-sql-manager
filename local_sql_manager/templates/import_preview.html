@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}预览导入 · 本地多维表格管理器{% endblock %}
+{% block body %}
+{% set nav = 'import' %}
+<div class="tool-page">
+  {% include "_tool_nav.html" %}
+  <header class="tool-header">
+    <h1 class="tool-title">预览导入：{{ file_name }}</h1>
+    <p class="tool-text">勾选要导入的工作表，确认目标表名与每列类型；空表会自动跳过。</p>
+  </header>
+
+  {% if error %}<div class="notice notice-error"><p class="notice-text">{{ error }}</p></div>{% endif %}
+
+  <form method="post" action="{{ url_for('import_export.import_confirm') }}">
+    <input type="hidden" name="token" value="{{ token }}">
+
+    <div class="tool-inline">
+      <label class="field field-inline">
+        <span class="field-label">同名表处理</span>
+        <select class="field-input" name="on_conflict">
+          {% set current_conflict = chosen_conflict if chosen_conflict is defined else 'skip' %}
+          {% for value, label in conflict_modes.items() %}
+          <option value="{{ value }}"{% if value == current_conflict %} selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <p class="form-hint">同名判断按工作表名：覆盖会把同名旧表移入回收站，建副本自动加后缀，跳过则不导入该表；目标表名只用于重命名新建的表。</p>
+    </div>
+
+    {% for sheet in sheets %}
+    <section class="sheet-card{% if sheet.empty %} is-empty{% endif %}">
+      <div class="sheet-head">
+        <label class="sheet-pick">
+          <input type="checkbox" name="sheet_{{ sheet.index }}" value="{{ sheet.name }}"
+            {% if choices is defined %}
+              {% if sheet.index in choices.selected %}checked{% endif %}
+            {% elif not sheet.empty %}checked{% endif %}
+            {% if sheet.empty %}disabled{% endif %}>
+          <span class="sheet-name">{{ sheet.name }}</span>
+        </label>
+        <span class="sheet-meta">{{ sheet.row_count }} 行 · {{ sheet.columns|length }} 列</span>
+        {% if sheet.empty %}<span class="badge badge-warn">空表，将跳过</span>{% endif %}
+        {% if sheet.sampled %}<span class="badge">类型按前 5000 行推断</span>{% endif %}
+      </div>
+
+      <label class="field field-inline">
+        <span class="field-label">目标表名</span>
+        <input class="field-input" type="text" name="name_{{ sheet.index }}" maxlength="64"
+          value="{% if choices is defined and choices.names.get(sheet.index) %}{{ choices.names[sheet.index] }}{% else %}{{ sheet.table_name }}{% endif %}"
+          {% if sheet.empty %}disabled{% endif %}>
+      </label>
+
+      {% if not sheet.empty %}
+      <div class="preview-scroll">
+        <table class="preview-table">
+          <thead>
+            <tr>
+              {% for column in sheet.columns %}
+              <th scope="col"{% if column.suspicious %} class="warn" title="该列取值混用，推断可能不准"{% endif %}>
+                <span class="preview-name">{{ column.name }}</span>
+                {% set overrides = choices.types.get(sheet.index, {}) if choices is defined else {} %}
+                {% set current_type = overrides.get(column.name, column.type) %}
+                <select class="field-input preview-type" name="type_{{ sheet.index }}_{{ column.index }}">
+                  {% for value, label in types.items() %}
+                  <option value="{{ value }}"{% if value == current_type %} selected{% endif %}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+              </th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in sheet.sample %}
+            <tr>
+              {% for value in row %}<td>{{ value }}</td>{% endfor %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if sheet.suspicious %}
+      <p class="form-hint warn-text">可疑列：{{ sheet.suspicious|join('、') }}（取值混用，建议核对类型）</p>
+      {% endif %}
+      {% endif %}
+    </section>
+    {% endfor %}
+
+    <div class="tool-actions">
+      <button class="button" type="submit">确认导入</button>
+    </div>
+  </form>
+
+  <form class="tool-actions" method="post" action="{{ url_for('import_export.import_cancel') }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="button button-ghost" type="submit">取消</button>
+  </form>
+</div>
+{% endblock %}

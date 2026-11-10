@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}操作历史 · 本地多维表格管理器{% endblock %}
+{% block body %}
+{% set nav = 'history' %}
+<div class="tool-page">
+  {% include "_tool_nav.html" %}
+  <header class="tool-header">
+    <h1 class="tool-title">操作历史</h1>
+    <p class="tool-text">按时间倒序列出审计记录；未撤销的操作可以回退，回退本身也会留下一条记录。</p>
+  </header>
+
+  <form class="tool-form tool-form-inline" method="get" action="{{ url_for('history.history_page') }}">
+    <label class="field field-inline">
+      <span class="field-label">数据表</span>
+      <select class="field-input" name="table">
+        <option value="">全部表</option>
+        {% for name in tables %}<option value="{{ name }}"{% if name == table %} selected{% endif %}>{{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="field field-inline">
+      <span class="field-label">条数</span>
+      <input class="field-input field-narrow" type="number" name="limit" min="1" max="500" value="{{ limit }}">
+    </label>
+    <button class="button button-ghost" type="submit">筛选</button>
+  </form>
+
+  {% if operations %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th scope="col">时间</th>
+        <th scope="col">操作</th>
+        <th scope="col">表</th>
+        <th scope="col">来源</th>
+        <th scope="col">摘要</th>
+        <th scope="col">状态</th>
+        <th scope="col">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for op in operations %}
+      <tr>
+        <td class="nowrap">{{ op.ts|local_time }}</td>
+        <td>#{{ op.id }} {{ op.kind_label }}</td>
+        <td>{{ op.table }}</td>
+        <td>{{ op.source_label }}</td>
+        <td>{{ op.summary }}</td>
+        <td>
+          {% if op.undone %}<span class="badge">已撤销（#{{ op.undone_by }}）</span>
+          {% elif op.irreversible %}<span class="badge badge-warn">不可撤销</span>
+          {% else %}<span class="badge badge-ok">可回退</span>{% endif %}
+          {% if op.kind == 'undo' and op.origin %}<span class="form-hint">回退 #{{ op.origin }}</span>{% endif %}
+        </td>
+        <td>
+          {% if op.undoable %}
+          <form method="post" action="{{ url_for('history.undo_operation', op_id=op.id) }}">
+            <input type="hidden" name="table" value="{{ table or '' }}">
+            <input type="hidden" name="limit" value="{{ limit }}">
+            <button class="button button-ghost button-small" type="submit">回退</button>
+          </form>
+          {% else %}<span class="form-hint">—</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="tool-text">还没有操作记录。</p>
+  {% endif %}
+</div>
+{% endblock %}

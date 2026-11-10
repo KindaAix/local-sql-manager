@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}合并数据表 · 本地多维表格管理器{% endblock %}
+{% block body %}
+{% set nav = 'merge' %}
+<div class="tool-page">
+  {% include "_tool_nav.html" %}
+  <header class="tool-header">
+    <h1 class="tool-title">合并数据表</h1>
+    <p class="tool-text">勾选至少 2 张受管表，填写新表名；先预览列对齐与类型冲突，确认后写入。</p>
+  </header>
+
+  {% if error %}<div class="notice notice-error"><p class="notice-text">{{ error }}</p></div>{% endif %}
+
+  <form class="tool-form" method="post" action="{{ url_for('tools.merge_preview') }}">
+    <fieldset class="field-group">
+      <legend class="field-label">源表</legend>
+      {% for item in tables %}
+      <label class="check-item">
+        <input type="checkbox" name="tables" value="{{ item.name }}"{% if item.name in selected %} checked{% endif %}>
+        <span class="check-name">{{ item.name }}</span>
+        <span class="check-meta">{{ item.rows }} 行 · {{ item.fields|length }} 列</span>
+      </label>
+      {% else %}
+      <p class="form-hint">还没有可合并的受管表；先导入一份 Excel 或启用外部表编辑。</p>
+      {% endfor %}
+    </fieldset>
+
+    <label class="field field-inline">
+      <span class="field-label">目标表名</span>
+      <input class="field-input" type="text" name="target" value="{{ target }}" maxlength="64" placeholder="例如：全部订单">
+    </label>
+    <button class="button" type="submit"{% if not tables %} disabled{% endif %}>预览合并</button>
+  </form>
+
+  {% if plan %}
+  <section class="tool-section">
+    <h2 class="tool-subtitle">预览结果</h2>
+    <p class="tool-text">共 {{ plan.rows }} 行，目标列 {{ plan.columns|length }} 个。</p>
+
+    <div class="plan-block">
+      <h3 class="plan-title">来源</h3>
+      <ul class="plan-list">
+        {% for source in plan.sources %}
+        <li>{{ source.table }}：{{ source.rows }} 行</li>
+        {% endfor %}
+      </ul>
+    </div>
+
+    <div class="plan-block">
+      <h3 class="plan-title">目标列</h3>
+      <div class="plan-chips">
+        {% for column in plan.columns %}<span class="chip">{{ column }}</span>{% endfor %}
+      </div>
+    </div>
+
+    <div class="plan-block">
+      <h3 class="plan-title">类型 / 选项冲突</h3>
+      {% if plan.conflicts %}
+      <table class="data-table">
+        <thead><tr><th scope="col">列</th><th scope="col">各表类型</th></tr></thead>
+        <tbody>
+          {% for conflict in plan.conflicts %}
+          <tr>
+            <td>{{ conflict.column }}</td>
+            <td>
+              {% for name, type in conflict.types.items() %}{{ name }}：{{ type_labels.get(type, type) }}{% if not loop.last %}；{% endif %}{% endfor %}
+              {% if conflict.options %}<div class="form-hint">选项不一致：{% for source, options in conflict.options.items() %}{{ source }}：{{ options|join('、') }}{% if not loop.last %}；{% endif %}{% endfor %}</div>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="form-hint">冲突列按第一张表的类型建列，其余值原样写入。</p>
+      {% else %}
+      <p class="form-hint">没有类型冲突。</p>
+      {% endif %}
+    </div>
+
+    <form class="tool-actions" method="post" action="{{ url_for('tools.merge_confirm') }}">
+      {% for name in selected %}<input type="hidden" name="tables" value="{{ name }}">{% endfor %}
+      <input type="hidden" name="target" value="{{ target }}">
+      <button class="button" type="submit">确认合并到「{{ target }}」</button>
+    </form>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}
