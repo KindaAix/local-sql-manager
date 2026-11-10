@@ -22,6 +22,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 from .models import ViewConfig
 from .query import build_order, build_where
@@ -178,14 +179,21 @@ def _check_row_limit(total: int) -> None:
         raise ValueError(f"导出行数超过上限 {MAX_ROWS} 行，请先筛选")
 
 
+def _clean_text(text: str) -> str:
+    """去掉 Excel 不接受的控制字符，避免整份文件损坏。"""
+    return ILLEGAL_CHARACTERS_RE.sub("", text)
+
+
 def _cell(worksheet, value):
     """Excel 单元格取值：bytes 转 base64；以 = 开头的文本强制按字符串写。"""
     if isinstance(value, bytes):
         value = base64.b64encode(value).decode("ascii")
-    if isinstance(value, str) and value.startswith("="):
-        cell = WriteOnlyCell(worksheet, value=value)
-        cell.data_type = "s"
-        return cell
+    if isinstance(value, str):
+        value = _clean_text(value)
+        if value.startswith("="):
+            cell = WriteOnlyCell(worksheet, value=value)
+            cell.data_type = "s"
+            return cell
     return value
 
 
@@ -199,16 +207,24 @@ def _csv_cell(value: object) -> str:
         return ""
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
-    if isinstance(value, str) and _CSV_FORMULA_PREFIX.match(value):
-        return "'" + value
-    if isinstance(value, float) and value.is_integer():
+    if isinstance(value, str):
+        value = _clean_text(value)
+        if _CSV_FORMULA_PREFIX.match(value):
+            return "'" + value
+        return value
+    if (
+        isinstance(value, float)
+        and value.is_integer()
+        and abs(value) < 1e16
+    ):
         return str(int(value))
     return str(value)
 
 
 def _sheet_name(raw: object, used: set[str]) -> str:
     """去掉非法字符与首尾单引号、截断到 31 字符，重名时追加 -2/-3。"""
-    base = _ILLEGAL_SHEET_CHARS.sub("", str(raw)).strip().strip("'").strip()
+    cleaned = _clean_text(str(raw))
+    base = _ILLEGAL_SHEET_CHARS.sub("", cleaned).strip().strip("'").strip()
     base = (base or "Sheet")[:_MAX_SHEET_NAME]
     candidate = base
     index = 2
@@ -269,7 +285,7 @@ def export_view(
     with _atomic_target(path) as temporary:
         workbook = Workbook(write_only=True)
         sheet = workbook.create_sheet(title=_sheet_name(table, set()))
-        sheet.append(columns)
+        sheet.append([_cell(sheet, name) for name in columns])
         sql = _select_sql(table, columns, where, order)
         for row in conn.execute(sql, params):
             sheet.append([_cell(sheet, value) for value in row])
@@ -288,6 +304,8 @@ def export_workbook(
     conn: sqlite3.Connection, tables: list[str], out_path: str | Path
 ) -> Path:
     """每张表一个 sheet 写入同一个 .xlsx，总行数共用 MAX_ROWS 上限。"""
+    if not tables:
+        raise ValueError("没有可导出的表")
     prepared = []
     total = 0
     for table in tables:
@@ -302,7 +320,7 @@ def export_workbook(
         used: set[str] = set()
         for name, columns, where, params, order in prepared:
             sheet = workbook.create_sheet(title=_sheet_name(name, used))
-            sheet.append(columns)
+            sheet.append([_cell(sheet, column) for column in columns])
             sql = _select_sql(name, columns, where, order)
             for row in conn.execute(sql, params):
                 sheet.append([_cell(sheet, value) for value in row])
@@ -346,7 +364,7 @@ def export_csv(
     with _atomic_target(path) as temporary:
         with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle, lineterminator="\r\n")
-            writer.writerow(selected)
+            writer.writerow([_csv_cell(name) for name in selected])
             for row in conn.execute(sql, params):
                 writer.writerow([_csv_cell(value) for value in row])
     return path

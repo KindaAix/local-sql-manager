@@ -236,6 +236,38 @@ class ExportTest(unittest.TestCase):
             export_table(self.conn, "订单", out)
         self.assertFalse(out.exists())
 
+    def test_formula_like_header_stays_string(self):
+        create_table(self.conn, "公式表", [ColumnSpec("=1+1", "text")])
+        now = utcnow_iso()
+        self.conn.execute(
+            'INSERT INTO "公式表" ("created_at", "updated_at", "=1+1")'
+            " VALUES (?, ?, ?)",
+            (now, now, "值"),
+        )
+        self.conn.commit()
+        out = export_table(self.conn, "公式表", self.path())
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        header = next(wb["公式表"].iter_rows(min_row=1, max_row=1))
+        self.assertEqual(header[0].value, "=1+1")
+        self.assertEqual(header[0].data_type, "s")
+
+        csv_path = Path(self.tmp.name) / "表头.csv"
+        export_csv(self.conn, "公式表", None, csv_path)
+        first_line = csv_path.read_bytes().decode("utf-8-sig").split("\r\n")[0]
+        self.assertEqual(first_line, "'=1+1,created_at,updated_at")
+
+    def test_control_characters_are_stripped(self):
+        self.insert("a\x01b", 10, "完成")
+        data = self.rows(self.sheet(export_table(self.conn, "订单", self.path())))
+        self.assertEqual(data[1][0], "ab")
+
+        csv_path = Path(self.tmp.name) / "控制.csv"
+        export_csv(self.conn, "订单", ["名称"], csv_path)
+        lines = csv_path.read_bytes().decode("utf-8-sig").split("\r\n")
+        self.assertEqual(lines[0], "名称")
+        self.assertEqual(lines[1], "ab")
+
 
 class WorkbookTest(unittest.TestCase):
     def setUp(self):
@@ -296,6 +328,21 @@ class WorkbookTest(unittest.TestCase):
         wb = load_workbook(out, read_only=True)
         self.addCleanup(wb.close)
         self.assertEqual(wb.sheetnames, ["报价"])
+
+    def test_sheet_name_strips_control_characters(self):
+        self.make_table("a\x01b")
+        out = export_workbook(
+            self.conn, ["a\x01b"], Path(self.tmp.name) / "控制.xlsx"
+        )
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        self.assertEqual(wb.sheetnames, ["ab"])
+
+    def test_empty_table_list_raises(self):
+        out = Path(self.tmp.name) / "空.xlsx"
+        with self.assertRaises(ValueError):
+            export_workbook(self.conn, [], out)
+        self.assertFalse(out.exists())
 
     def test_long_sheet_name_is_truncated_to_31(self):
         name = "很长的表名" * 8
@@ -388,6 +435,15 @@ class CsvTest(unittest.TestCase):
         )
         self.assertEqual(data[1], ["-5"])
         self.assertEqual(data[2], ["3.14"])
+
+    def test_large_integral_floats_keep_python_notation(self):
+        self.insert("大数", 1e308, "完成")
+        self.insert("负零", -0.0, "完成")
+        data = self.read(
+            export_csv(self.conn, "订单", ["金额"], Path(self.tmp.name) / "big.csv")
+        )
+        self.assertEqual(data[1], ["1e+308"])
+        self.assertEqual(data[2], ["0"])
 
     def test_all_formula_prefixes_are_quoted(self):
         values = ("+1", "-1", "@SUM(A1)", "\t=1")
