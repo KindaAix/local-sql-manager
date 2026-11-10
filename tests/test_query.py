@@ -43,7 +43,7 @@ class TestBuildWhere(unittest.TestCase):
         sql, params = build_where(
             [{"column": "已完成", "op": "is_true"}], [Field("已完成", "checkbox")]
         )
-        self.assertIn('CAST("已完成" AS INTEGER) = 1', sql)
+        self.assertIn('COALESCE(CAST("已完成" AS INTEGER), 0) = 1', sql)
         self.assertEqual(params, [])
 
     def test_contains_escapes_wildcards(self):
@@ -87,6 +87,58 @@ class TestBuildWhere(unittest.TestCase):
         self.assertEqual(sql.count(" AND "), 1)
         self.assertEqual(params, ["%云%", 10.0])
 
+    def test_date_value_is_normalized(self):
+        _, params = build_where(
+            [{"column": "截止日期", "op": "gte", "value": "2026-1-5"}],
+            [Field("截止日期", "date")],
+        )
+        self.assertEqual(params, ["2026-01-05"])
+
+    def test_slash_date_value_is_normalized(self):
+        _, params = build_where(
+            [{"column": "截止日期", "op": "eq", "value": "2026/1/5"}],
+            [Field("截止日期", "date")],
+        )
+        self.assertEqual(params, ["2026-01-05"])
+
+    def test_date_time_value_is_normalized(self):
+        _, params = build_where(
+            [{"column": "截止日期", "op": "lte", "value": "2026/1/5 10:30"}],
+            [Field("截止日期", "date")],
+        )
+        self.assertEqual(params, ["2026-01-05"])
+
+    def test_non_finite_number_ignored(self):
+        for raw in ("nan", "inf", "-inf"):
+            self.assertEqual(
+                build_where(
+                    [{"column": "金额", "op": "gt", "value": raw}],
+                    [Field("金额", "number")],
+                ),
+                ("", []),
+            )
+
+    def test_non_dict_filter_ignored(self):
+        sql, params = build_where(
+            ["垃圾", None, {"column": "金额", "op": "gt", "value": 1}],
+            [Field("金额", "number")],
+        )
+        self.assertIn('CAST("金额" AS REAL) > ?', sql)
+        self.assertEqual(params, [1.0])
+
+    def test_checkbox_false_includes_null(self):
+        sql, _ = build_where(
+            [{"column": "已完成", "op": "is_false"}], [Field("已完成", "checkbox")]
+        )
+        self.assertIn("COALESCE", sql)
+
+    def test_checkbox_true_excludes_null(self):
+        sql, _ = build_where(
+            [{"column": "已完成", "op": "is_true"}], [Field("已完成", "checkbox")]
+        )
+        self.assertIn("= 1", sql)
+        self.assertIn("COALESCE", sql)
+
 
 class TestBuildOrder(unittest.TestCase):
     def test_order_quotes_column_and_defaults_asc(self):
@@ -107,6 +159,9 @@ class TestBuildOrder(unittest.TestCase):
     def test_empty_order(self):
         self.assertEqual(build_order([], None), "")
         self.assertEqual(build_order(None, None), "")
+
+    def test_non_dict_sort_ignored(self):
+        self.assertEqual(build_order(["垃圾", {"column": "金额"}], None), '"金额" ASC')
 
     def test_invalid_direction_defaults_asc(self):
         self.assertEqual(
@@ -167,6 +222,30 @@ class TestPageSql(unittest.TestCase):
         self.assertIn("contains", OPS["text"])
         self.assertIn("gte", OPS["number"])
         self.assertIn("is_true", OPS["checkbox"])
+
+    def test_page_sql_can_drop_tiebreaker(self):
+        sql, _ = page_sql(
+            "legacy",
+            [],
+            ViewConfig(),
+            limit=10,
+            offset=0,
+            soft_delete=False,
+            tiebreaker=None,
+        )
+        self.assertNotIn("ORDER BY", sql)
+
+    def test_page_sql_uses_custom_tiebreaker(self):
+        sql, _ = page_sql(
+            "legacy",
+            [],
+            ViewConfig(),
+            limit=10,
+            offset=0,
+            soft_delete=False,
+            tiebreaker="rowid",
+        )
+        self.assertIn("ORDER BY rowid ASC", sql)
 
 
 if __name__ == "__main__":

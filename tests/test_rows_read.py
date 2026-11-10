@@ -123,6 +123,17 @@ class TestGetPage(unittest.TestCase):
         self.assertEqual(page.total, 1)
         self.assertEqual(page.rows[0]["名称"], "a")
 
+    def test_table_without_id_pages_by_rowid(self):
+        self.conn.execute('CREATE TABLE "noid" ("名称" TEXT)')
+        self.conn.executemany(
+            'INSERT INTO "noid" ("名称") VALUES (?)', [("a",), ("b",), ("c",)]
+        )
+        names = []
+        for number in (1, 2, 3):
+            page = get_page(self.conn, "noid", ViewConfig(), page=number, page_size=1)
+            names.extend(row["名称"] for row in page.rows)
+        self.assertEqual(names, ["a", "b", "c"])
+
 
 if __name__ == "__main__":
     unittest.main()

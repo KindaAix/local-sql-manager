@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from .models import Field, ViewConfig
 
 # 每种逻辑字段可用的操作符，界面据此渲染筛选菜单。
@@ -39,9 +41,21 @@ def _is_blank(value: object) -> bool:
 
 def _to_number(value: object) -> float | None:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
+
+
+def _date_part(value: object) -> str:
+    """把日期取值归一成 YYYY-MM-DD；认不出时退回前 10 个字符。"""
+    text = str(value).strip()
+    head = text.split(" ")[0].split("T")[0].replace("/", "-")
+    parts = head.split("-")
+    if len(parts) == 3 and all(part.isdigit() for part in parts):
+        year, month, day = (int(part) for part in parts)
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    return text[:10]
 
 
 def _clause(field: Field, op: str, value: object) -> tuple[str, list] | None:
@@ -51,9 +65,9 @@ def _clause(field: Field, op: str, value: object) -> tuple[str, list] | None:
     if op == "not_empty":
         return f"({column} IS NOT NULL AND TRIM(CAST({column} AS TEXT)) <> '')", []
     if op == "is_true":
-        return f"CAST({column} AS INTEGER) = 1", []
+        return f"COALESCE(CAST({column} AS INTEGER), 0) = 1", []
     if op == "is_false":
-        return f"CAST({column} AS INTEGER) = 0", []
+        return f"COALESCE(CAST({column} AS INTEGER), 0) = 0", []
     if _is_blank(value):
         return None
     if op in ("contains", "not_contains"):
@@ -67,7 +81,7 @@ def _clause(field: Field, op: str, value: object) -> tuple[str, list] | None:
             return None
         return f"CAST({column} AS REAL) {comparison} ?", [number]
     if field.type == "date":
-        return f"substr({column}, 1, 10) {comparison} ?", [str(value).strip()[:10]]
+        return f"substr({column}, 1, 10) {comparison} ?", [_date_part(value)]
     return f"{column} {comparison} ?", [str(value)]
 
 
@@ -77,6 +91,8 @@ def build_where(filters: list, fields: list) -> tuple[str, list]:
     clauses = []
     params = []
     for item in filters or []:
+        if not isinstance(item, dict):
+            continue
         column = item.get("column")
         field = by_name.get(column)
         if field is None:
@@ -95,10 +111,12 @@ def build_where(filters: list, fields: list) -> tuple[str, list]:
 def build_order(sorts: list, group: dict | None) -> str:
     """把排序与分组转成不带 ORDER BY 的 SQL 片段，分组列总在最前。"""
     parts = []
-    group_column = (group or {}).get("column")
+    group_column = group.get("column") if isinstance(group, dict) else None
     if group_column:
         parts.append(f"{_quote(group_column)} ASC")
     for item in sorts or []:
+        if not isinstance(item, dict):
+            continue
         column = item.get("column")
         if not column:
             continue
@@ -114,8 +132,9 @@ def page_sql(
     limit: int,
     offset: int,
     soft_delete: bool = True,
+    tiebreaker: str | None = '"id"',
 ) -> tuple[str, list]:
-    """生成一页数据的查询；默认过滤软删行，id 作为稳定的末位排序。"""
+    """生成一页数据的查询；默认过滤软删行，并以 tiebreaker 保证跨页顺序稳定。"""
     names = {field.name for field in fields}
     where, params = build_where(view.filters, fields)
     conditions = []
@@ -128,9 +147,23 @@ def page_sql(
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
 
-    group = view.group if (view.group or {}).get("column") in names else None
-    sorts = [item for item in view.sorts if item.get("column") in names]
+    group = (
+        view.group
+        if isinstance(view.group, dict) and view.group.get("column") in names
+        else None
+    )
+    sorts = [
+        item
+        for item in view.sorts or []
+        if isinstance(item, dict) and item.get("column") in names
+    ]
+    order_parts = []
     order = build_order(sorts, group)
-    sql += " ORDER BY " + (f"{order}, " if order else "") + '"id" ASC'
+    if order:
+        order_parts.append(order)
+    if tiebreaker:
+        order_parts.append(f"{tiebreaker} ASC")
+    if order_parts:
+        sql += " ORDER BY " + ", ".join(order_parts)
     sql += " LIMIT ? OFFSET ?"
     return sql, params + [limit, offset]

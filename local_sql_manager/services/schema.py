@@ -47,6 +47,11 @@ def _quote(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+def _index_name(table: str, column: str) -> str:
+    """索引名带表名长度前缀，避免 "a_b"+"c" 与 "a"+"b_c" 撞名。"""
+    return f"__lsm_idx_{len(table)}_{table}_{column}"
+
+
 @contextmanager
 def _savepoint(conn: sqlite3.Connection, name: str):
     """在一个保存点内执行，失败回滚且不破坏调用方已开启的事务。"""
@@ -71,6 +76,8 @@ def create_table(
 
     调用方若已开启事务，本函数加入该事务；否则自身提交。
     """
+    if str(name).startswith("__lsm_"):
+        raise ValueError(f"表名不能使用内部前缀 __lsm_：{name}")
     specs = list(columns)
     for spec in specs:
         if spec.type not in TYPES:
@@ -118,7 +125,7 @@ def list_tables(conn: sqlite3.Connection) -> list[str]:
 
 
 def get_fields(conn: sqlite3.Connection, table: str) -> list[Field]:
-    """按 position 返回业务字段；未登记的���返回空列表。"""
+    """按 position 返回业务字段；未登记的表返回空列表。"""
     rows = conn.execute(
         """
         SELECT "column", "type", "options_json", "position", "width"
@@ -136,10 +143,10 @@ def get_fields(conn: sqlite3.Connection, table: str) -> list[Field]:
 
 
 def ensure_indexes(conn: sqlite3.Connection, table: str) -> None:
-    """为每个业务列补建普通索引 __lsm_idx_<表>_<列>，已存在则跳过。"""
+    """为每个业务列补建普通索引 __lsm_idx_<表名长度>_<表>_<列>，已存在则跳过。"""
     with _savepoint(conn, "lsm_ensure_indexes"):
         for field in get_fields(conn, table):
-            index = f"__lsm_idx_{table}_{field.name}"
+            index = _index_name(table, field.name)
             conn.execute(
                 f"CREATE INDEX IF NOT EXISTS {_quote(index)} "
                 f"ON {_quote(table)} ({_quote(field.name)})"

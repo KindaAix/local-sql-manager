@@ -30,6 +30,8 @@ def _conditions(view: ViewConfig, fields: list, soft_delete: bool) -> tuple[list
 
 
 def _aggregate_expr(aggregate: dict, by_name: dict) -> str | None:
+    if not isinstance(aggregate, dict):
+        return None
     field = by_name.get(aggregate.get("column"))
     fn = aggregate.get("fn")
     if field is None or fn not in _AGGREGATE_FNS:
@@ -46,7 +48,7 @@ def _load_groups(
     fields: list,
     soft_delete: bool,
 ) -> tuple:
-    column = (view.group or {}).get("column")
+    column = view.group.get("column") if isinstance(view.group, dict) else None
     by_name = {field.name: field for field in fields}
     if column not in by_name:
         return ()
@@ -86,6 +88,8 @@ def get_page(
     page_size = max(1, int(page_size))
     fields = get_fields(conn, table)
     soft_delete = _has_column(conn, table, "deleted_at")
+    # 没有 id 列时退回 rowid，避免 ORDER BY "id" 被 SQLite 当成常量而静默失效。
+    tiebreaker = '"id"' if _has_column(conn, table, "id") else "rowid"
 
     sql, params = page_sql(
         table,
@@ -94,6 +98,7 @@ def get_page(
         page_size,
         (page - 1) * page_size,
         soft_delete=soft_delete,
+        tiebreaker=tiebreaker,
     )
     cursor = conn.execute(sql, params)
     names = [description[0] for description in cursor.description]
