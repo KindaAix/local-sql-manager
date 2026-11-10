@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from . import audit
 from .models import Field
 from .types import TYPES
 from .util import utcnow_iso
@@ -76,8 +77,7 @@ def create_table(
 
     调用方若已开启事务，本函数加入该事务；否则自身提交。
     """
-    if str(name).lower().startswith(("__lsm_", "sqlite_")):
-        raise ValueError(f"表名不能使用内部前缀：{name}")
+    _reject_reserved_name(name)
     specs = list(columns)
     for spec in specs:
         if spec.type not in TYPES:
@@ -151,3 +151,213 @@ def ensure_indexes(conn: sqlite3.Connection, table: str) -> None:
                 f"CREATE INDEX IF NOT EXISTS {_quote(index)} "
                 f"ON {_quote(table)} ({_quote(field.name)})"
             )
+
+TRASH_PREFIX = "__lsm_trash_"
+
+
+def _reject_reserved_name(name: str) -> None:
+    """内部表与 sqlite 系统表的命名空间不允许建业务表。"""
+    if str(name).lower().startswith(("__lsm_", "sqlite_")):
+        raise ValueError(f"表名不能使用内部前缀：{name}")
+
+
+def _ensure_user_table(conn: sqlite3.Connection, table: str) -> None:
+    if str(table).lower().startswith(("__lsm_", "sqlite_")):
+        raise ValueError(f"不能操作内部表：{table}")
+    if not _table_exists(conn, table):
+        raise ValueError(f"表不存在：{table}")
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def _index_prefix(table: str) -> str:
+    """该表自动索引名的公共前缀，与 _index_name 的格式保持一致。"""
+    return f"__lsm_idx_{len(table)}_{table}_"
+
+
+def _clear_metadata(conn: sqlite3.Connection, table: str) -> None:
+    """删掉某个物理表名下残留的元数据行。
+
+    __lsm_table 的登记是普通 INSERT，表被外部手段改动后可能留下同名孤儿行；
+    重命名/恢复的目标名要先清干净，避免主键冲突。
+    """
+    for meta in ("__lsm_table", "__lsm_field", "__lsm_view"):
+        conn.execute(f'DELETE FROM "{meta}" WHERE "table_name" = ?', (table,))
+
+
+def _relocate_table(conn: sqlite3.Connection, old: str, new: str) -> None:
+    """把表 old 改名为 new，字段/视图元数据与自动索引一并跟随。
+
+    SQLite 改名不会改索引名，而索引名在库内必须唯一；不重建的话，回收站里
+    的表会一直占着「__lsm_idx_<原名>_」这些名字，同名新表建索引时会被
+    IF NOT EXISTS 静默跳过。
+    """
+    indexes = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?",
+            (old,),
+        )
+        if row[0].startswith(_index_prefix(old))
+    ]
+    conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+    _clear_metadata(conn, new)
+    for meta in ("__lsm_table", "__lsm_field", "__lsm_view"):
+        conn.execute(
+            f'UPDATE "{meta}" SET "table_name" = ? WHERE "table_name" = ?',
+            (new, old),
+        )
+    for index in indexes:
+        conn.execute(f"DROP INDEX IF EXISTS {_quote(index)}")
+    ensure_indexes(conn, new)
+
+
+def _trash_name(physical: str) -> str | None:
+    """从 __lsm_trash_<op>_<原名> 还原原名；不是回收站名时返回 None。"""
+    if not physical.startswith(TRASH_PREFIX):
+        return None
+    op, sep, name = physical[len(TRASH_PREFIX) :].partition("_")
+    if not sep or not op.isdigit() or not name:
+        return None
+    return name
+
+
+def _find_trashed(conn: sqlite3.Connection, name: str) -> list[tuple[int, str]]:
+    """返回与原表名匹配的回收站表 [(trashed_op, 物理名)]，按 op 升序。"""
+    rows = conn.execute(
+        'SELECT "table_name", "trashed_op" FROM "__lsm_table"'
+        ' WHERE "status" = ?',
+        ("trashed",),
+    ).fetchall()
+    found = [(row[1] or 0, row[0]) for row in rows if _trash_name(row[0]) == name]
+    return sorted(found)
+
+
+def rename_table(
+    conn: sqlite3.Connection, old: str, new: str, source: str = "web"
+) -> int:
+    """重命名表并记审计，返回 __lsm_op.id。
+
+    调用方若已开启事务，本函数加入该事务；否则自身提交。
+    """
+    if not str(new).strip():
+        raise ValueError("表名不能为空")
+    _reject_reserved_name(new)
+    _ensure_user_table(conn, old)
+    if new == old:
+        raise ValueError("新表名与原表名相同")
+    if _table_exists(conn, new):
+        raise ValueError(f"表已存在：{new}")
+    with _savepoint(conn, "lsm_rename_table"):
+        op = audit.record(
+            conn, "rename_table", old, source, {"old": old, "new": new}
+        )
+        _relocate_table(conn, old, new)
+    return op
+
+
+def drop_table(conn: sqlite3.Connection, table: str, source: str = "web") -> int:
+    """把表移入「已删除表」区：改名为 __lsm_trash_<op>_<name>，返回 op id。
+
+    调用方若已开启事务，本函数加入该事务；否则自身提交。
+    """
+    _ensure_user_table(conn, table)
+    with _savepoint(conn, "lsm_drop_table"):
+        op = audit.record(conn, "drop_table", table, source, {"name": table})
+        physical = f"{TRASH_PREFIX}{op}_{table}"
+        _relocate_table(conn, table, physical)
+        cur = conn.execute(
+            'UPDATE "__lsm_table" SET "status" = ?, "trashed_op" = ?'
+            ' WHERE "table_name" = ?',
+            ("trashed", op, physical),
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                'INSERT INTO "__lsm_table"'
+                ' ("table_name", "status", "created_at", "source_file", "trashed_op")'
+                " VALUES (?, 'trashed', ?, NULL, ?)",
+                (physical, utcnow_iso(), op),
+            )
+    return op
+
+
+def list_trashed_tables(conn: sqlite3.Connection) -> list[dict]:
+    """列出「已删除表」区：原表名、当前物理名与删除操作 id。"""
+    rows = conn.execute(
+        'SELECT "table_name", "trashed_op" FROM "__lsm_table"'
+        ' WHERE "status" = ? ORDER BY "trashed_op", "table_name"',
+        ("trashed",),
+    ).fetchall()
+    return [
+        {
+            "name": _trash_name(row[0]) or row[0],
+            "table_name": row[0],
+            "trashed_op": row[1],
+        }
+        for row in rows
+    ]
+
+
+def restore_table(conn: sqlite3.Connection, table: str, source: str = "web") -> int:
+    """恢复回收站里的表；重名时自动加 _2、_3 后缀。返回 op id。
+
+    调用方若已开启事务，本函数加入该事务；否则自身提交。
+    """
+    candidates = _find_trashed(conn, table)
+    if not candidates:
+        raise ValueError(f"回收站中没有该表：{table}")
+    physical = candidates[-1][1]
+    target = table
+    suffix = 2
+    while _table_exists(conn, target):
+        target = f"{table}_{suffix}"
+        suffix += 1
+    with _savepoint(conn, "lsm_restore_table"):
+        op = audit.record(
+            conn,
+            "restore_table",
+            table,
+            source,
+            {"name": table, "restored_as": target, "trashed_as": physical},
+        )
+        _relocate_table(conn, physical, target)
+        conn.execute(
+            'UPDATE "__lsm_table" SET "status" = ?, "trashed_op" = NULL'
+            ' WHERE "table_name" = ?',
+            ("active", target),
+        )
+    return op
+
+
+def purge_table(conn: sqlite3.Connection, table: str, source: str = "web") -> int:
+    """彻底删除回收站里的表并清理元数据；记 irreversible 审计，返回 op id。
+
+    调用方若已开启事务，本函数加入该事务；否则自身提交。
+    """
+    name = _trash_name(table)
+    if name is not None:
+        physical = table
+        if physical not in [p for _, p in _find_trashed(conn, name)]:
+            raise ValueError(f"回收站中没有该表：{name}")
+    else:
+        candidates = _find_trashed(conn, table)
+        if not candidates:
+            raise ValueError(f"回收站中没有该表：{table}")
+        name, physical = table, candidates[-1][1]
+    with _savepoint(conn, "lsm_purge_table"):
+        op = audit.record(
+            conn,
+            "purge_table",
+            name,
+            source,
+            {"name": name, "table_name": physical},
+            irreversible=True,
+        )
+        conn.execute(f"DROP TABLE {_quote(physical)}")
+        _clear_metadata(conn, physical)
+    return op
