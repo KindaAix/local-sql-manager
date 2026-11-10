@@ -208,6 +208,10 @@ def import_upload():
     path = directory / filename
     try:
         upload.save(path)
+        if path.stat().st_size == 0:
+            shutil.rmtree(directory, ignore_errors=True)
+            flash("文件里没有可导入的数据。")
+            return redirect(url_for("import_export.import_page"))
         try:
             previews = parse_workbook(path)
         except Exception:  # noqa: BLE001 文件内容不可信，统一按“无法解析”处理
@@ -215,9 +219,10 @@ def import_upload():
             shutil.rmtree(directory, ignore_errors=True)
             flash("无法解析该文件，请确认是有效的 .xlsx 或 .csv。")
             return redirect(url_for("import_export.import_page"))
-        if not previews:
+        # 0 字节文件与「只有表头 / 全是空表」的文件都不进入预览。
+        if not previews or all(preview.empty for preview in previews):
             shutil.rmtree(directory, ignore_errors=True)
-            flash("文件里没有可导入的工作表。")
+            flash("文件里没有可导入的数据。")
             return redirect(url_for("import_export.import_page"))
     except OSError:
         shutil.rmtree(directory, ignore_errors=True)
@@ -309,9 +314,16 @@ def import_confirm():
 
     choices = _form_choices(previews)
     if not choices["selected"]:
-        _pending_drop(token)
-        flash("请至少选择一个工作表。")
-        return redirect(url_for("import_export.import_page"))
+        # 保留 token 与预览状态，让用户在原页重新勾选后直接确认。
+        flash("请至少勾选一张工作表。")
+        context = _preview_context(
+            state,
+            token,
+            error="请至少勾选一张工作表",
+            choices=choices,
+            chosen_conflict=on_conflict,
+        )
+        return render_template("import_preview.html", **context), 400
 
     conn = get_conn()
     try:
@@ -405,13 +417,19 @@ def _csv_columns(conn: sqlite3.Connection, table: str, config: ViewConfig) -> li
 
 
 def _send_download(path: Path, directory: Path, name: str, mimetype: str):
-    """发文件，并在响应关闭后删除整个临时目录（Windows 上文件需先关闭）。"""
+    """发文件，并在响应关闭后删除整个临时目录（Windows 上文件需先关闭）。
+
+    send_file 默认 direct_passthrough=True，WSGI 服务器只关闭文件对象、不会
+    调用 Response.close()，call_on_close 就永远不触发；这里显式关掉直接透传，
+    让响应关闭时能跑到清理回调。
+    """
     response = send_file(
         path,
         as_attachment=True,
         download_name=name,
         mimetype=mimetype,
     )
+    response.direct_passthrough = False
     response.call_on_close(lambda: shutil.rmtree(directory, ignore_errors=True))
     return response
 

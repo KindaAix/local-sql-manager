@@ -83,10 +83,18 @@ def trash_page():
             }
         )
 
+    trashed_tables = schema.list_trashed_tables(conn)
+    counts: dict[str, int] = {}
+    for item in trashed_tables:
+        counts[item["name"]] = counts.get(item["name"], 0) + 1
+    for item in trashed_tables:
+        # 同名多张时按名字无法唯一定位；恢复会自动加后缀，彻底删除则禁止。
+        item["duplicated"] = counts[item["name"]] > 1
     return render_template(
         "trash.html",
         groups=groups,
-        trashed_tables=schema.list_trashed_tables(conn),
+        trashed_tables=trashed_tables,
+        has_duplicate_tables=any(item["duplicated"] for item in trashed_tables),
     )
 
 
@@ -161,18 +169,18 @@ def _after_write(message: str, payload: dict | None = None):
     return redirect(url_for("trash.trash_page"))
 
 
-def _failure(exc: BaseException):
-    if isinstance(exc, ValueError):
-        message = str(exc) or "操作失败"
-        status = 400
-    else:
-        logger.exception("回收站操作失败")
-        message = "操作失败，请重试"
-        status = 500
+def _api_error(message: str, status: int):
     if request.is_json:
         return jsonify({"error": message}), status
     flash(message)
     return redirect(url_for("trash.trash_page"))
+
+
+def _failure(exc: BaseException):
+    if isinstance(exc, ValueError):
+        return _api_error(str(exc) or "操作失败", 400)
+    logger.exception("回收站操作失败")
+    return _api_error("操作失败，请重试", 500)
 
 
 # --- 行操作 -----------------------------------------------------------
@@ -185,6 +193,9 @@ def restore_rows_api():
         body = _payload()
         table = _require_rows_table(conn, body.get("table"))
         op = rows.restore_rows(conn, table, _ids(body.get("ids")), source="web")
+        if op is None:
+            conn.rollback()
+            return _api_error("该行不在回收站", 409)
         conn.commit()
     except Exception as exc:  # noqa: BLE001 统一映射
         conn.rollback()
@@ -235,6 +246,15 @@ def purge_table_api():
     try:
         body = _payload()
         name = _require_table_name(body.get("name") or body.get("table"))
+        # 同名多张已删除表时按名字只会命中最新一张；不可逆操作一律拒绝。
+        duplicates = [
+            item for item in schema.list_trashed_tables(conn) if item["name"] == name
+        ]
+        if len(duplicates) > 1:
+            conn.rollback()
+            return _api_error(
+                "存在同名已删除表，请先恢复其中一张再处理", 409
+            )
         op = schema.purge_table(conn, name, source="web")
         conn.commit()
     except Exception as exc:  # noqa: BLE001 统一映射

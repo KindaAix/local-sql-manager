@@ -22,6 +22,7 @@
       <input class="field-input field-narrow" type="number" name="limit" min="1" max="500" value="{{ limit }}">
     </label>
     <button class="button button-ghost" type="submit">筛选</button>
+    <span class="form-hint">条数范围 1–500；留空或非数字按 50。</span>
   </form>
 
   {% if operations %}
@@ -48,7 +49,8 @@
         <td>
           {% if op.undone %}<span class="badge">已撤销（#{{ op.undone_by }}）</span>
           {% elif op.irreversible %}<span class="badge badge-warn">不可撤销</span>
-          {% else %}<span class="badge badge-ok">可回退</span>{% endif %}
+          {% elif op.undoable %}<span class="badge badge-ok">可回退</span>
+          {% else %}<span class="badge">无撤销</span>{% endif %}
           {% if op.kind == 'undo' and op.origin %}<span class="form-hint">回退 #{{ op.origin }}</span>{% endif %}
         </td>
         <td>

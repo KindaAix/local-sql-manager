@@ -24,6 +24,42 @@ from .grid_api import (
 
 bp = Blueprint("views_api", __name__, url_prefix="/api/views")
 
+MAX_VIEW_NAME = 64
+
+# 面板配置里这几项必须是数组；中文名用于错误提示。
+_CONFIG_LISTS = {
+    "filters": "筛选条件",
+    "sorts": "排序",
+    "hidden": "隐藏列",
+    "order": "列序",
+    "aggregates": "汇总",
+}
+
+
+def _checked_config(raw: object) -> dict:
+    """校验 config 的容器结构；字段名引用是否有效交给服务层裁剪。"""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise _ApiError("config 必须是对象")
+    for key, label in _CONFIG_LISTS.items():
+        if key in raw and not isinstance(raw[key], list):
+            raise _ApiError(f"{label}必须是数组")
+    if "widths" in raw and not isinstance(raw["widths"], dict):
+        raise _ApiError("列宽必须是 {列: 像素} 对象")
+    if raw.get("group") is not None and not isinstance(raw.get("group"), dict):
+        raise _ApiError("分组必须是对象")
+    return raw
+
+
+def _checked_name(raw: object) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise _ApiError("视图名称不能为空")
+    name = raw.strip()
+    if len(name) > MAX_VIEW_NAME:
+        raise _ApiError(f"视图名称不能超过 {MAX_VIEW_NAME} 个字符")
+    return name
+
 
 @bp.post("")
 def create():
@@ -36,13 +72,9 @@ def create():
             raise _ApiError("请指定表名")
         _require_table(conn, table)
         _require_managed(conn, table)
-        name = body.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise _ApiError("视图名称不能为空")
-        config = body.get("config")
-        if config is not None and not isinstance(config, dict):
-            raise _ApiError("config 必须是对象")
-        return views.create_view(conn, table, name, config or {})
+        name = _checked_name(body.get("name"))
+        config = _checked_config(body.get("config"))
+        return views.create_view(conn, table, name, config)
 
     return _run(write, lambda conn, view_id: (jsonify({"ok": True, "id": view_id}), 201))
 
@@ -56,14 +88,14 @@ def update(view_id: int):
         row = views._fetch(conn, view_id)
         if row is None:
             raise _ApiError("视图不存在", 404)
-        name = body.get("name")
-        if name is not None and not isinstance(name, str):
-            raise _ApiError("视图名称必须是文本")
-        config = body.get("config")
-        if config is not None and not isinstance(config, dict):
-            raise _ApiError("config 必须是对象")
-        if name is None and config is None:
+        raw_name = body.get("name")
+        name = None if raw_name is None else _checked_name(raw_name)
+        raw_config = body.get("config")
+        if name is None and raw_config is None:
             raise _ApiError("没有需要保存的修改")
+        config = (
+            None if raw_config is None else _checked_config(raw_config)
+        )
         current = views.load_config(conn, view_id)
         if config is None:
             merged = current

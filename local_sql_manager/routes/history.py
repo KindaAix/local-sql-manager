@@ -50,13 +50,12 @@ VIEW_ACTIONS = {"create": "新建", "rename": "重命名", "delete": "删除"}
 
 
 def _parse_limit(raw: object) -> int:
+    """非数字回落 50；数字夹到 1..500（与服务层「<=0 返回空」区分开）。"""
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError):
         return DEFAULT_LIMIT
-    if value <= 0:
-        return DEFAULT_LIMIT
-    return min(value, MAX_LIMIT)
+    return max(1, min(value, MAX_LIMIT))
 
 
 def _row_count(payload: dict) -> int:
@@ -118,7 +117,12 @@ def _present(op: dict) -> dict:
     item["source_label"] = SOURCE_LABELS.get(op["source"], op["source"])
     item["summary"] = _summarize(op)
     item["undone"] = op.get("undone_by") is not None
-    item["undoable"] = not item["undone"] and not op.get("irreversible")
+    # 没有注册撤销处理器的 kind（例如 view）不显示「回退」，避免必失败的按钮。
+    item["undoable"] = (
+        undo.supports(op["kind"])
+        and not item["undone"]
+        and not op.get("irreversible")
+    )
     item["origin"] = (op.get("payload") or {}).get("op")
     return item
 

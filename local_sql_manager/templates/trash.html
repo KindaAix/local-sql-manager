@@ -48,13 +48,16 @@
 
   <section class="tool-section">
     <h2 class="tool-subtitle">已删除的表</h2>
+    {% if has_duplicate_tables %}
+    <p class="form-hint warn-text">存在同名已删除表，请先恢复其中一张再处理；恢复后名字会自动加后缀。</p>
+    {% endif %}
     {% if trashed_tables %}
     <table class="data-table">
       <thead><tr><th scope="col">表名</th><th scope="col">删除操作</th><th scope="col">操作</th></tr></thead>
       <tbody>
         {% for item in trashed_tables %}
         <tr>
-          <td>{{ item.name }}</td>
+          <td>{{ item.name }}{% if item.duplicated %} <span class="badge badge-warn">同名</span>{% endif %}</td>
           <td>{% if item.trashed_op %}#{{ item.trashed_op }}{% else %}—{% endif %}</td>
           <td class="row-actions">
             <form method="post" action="{{ url_for('trash.restore_table_api') }}">
@@ -63,7 +66,7 @@
             </form>
             <form method="post" action="{{ url_for('trash.purge_table_api') }}" onsubmit="return confirm('彻底删除整张表后无法恢复，确定继续吗？');">
               <input type="hidden" name="name" value="{{ item.name }}">
-              <button class="button button-ghost button-small button-danger" type="submit">彻底删除</button>
+              <button class="button button-ghost button-small button-danger" type="submit"{% if item.duplicated %} disabled title="存在同名已删除表，请先恢复其中一张"{% endif %}>彻底删除</button>
             </form>
           </td>
         </tr>

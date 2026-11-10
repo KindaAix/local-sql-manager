@@ -264,7 +264,7 @@
       sorts: sorts,
       hidden: hidden,
       order: order,
-      widths: {},
+      // 不提交 widths：路由在键缺失时沿用已保存的列宽，避免面板保存清空拖拽结果。
       group: groupSelect && groupSelect.value ? { column: groupSelect.value } : null,
       aggregates: aggregates
     };

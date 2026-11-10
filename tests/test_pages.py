@@ -4,18 +4,26 @@
 所有落库断言都用标准库 sqlite3 重新打开库文件核对，不信任路由里的连接。
 """
 
+import http.client
 import io
+import json
 import os
 import re
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from urllib.parse import quote
+
+from openpyxl import Workbook
+from werkzeug.serving import make_server
 
 from local_sql_manager.app import create_app
 from local_sql_manager.routes import import_export
-from local_sql_manager.services import audit, rows, schema, views
+from local_sql_manager.services import audit, rows, schema, undo, views
 from local_sql_manager.services.library import open_library
 from local_sql_manager.services.schema import ColumnSpec
 from local_sql_manager.services.share import export_lsmf
@@ -58,7 +66,8 @@ class PagesTest(unittest.TestCase):
         self.library.conn.execute('INSERT INTO "外部表" ("名称") VALUES (?)', ("甲",))
         self.library.conn.execute('INSERT INTO "外部表" ("名称") VALUES (?)', ("乙",))
         self.library.conn.commit()
-        self.client = create_app(self.library).test_client()
+        self.app = create_app(self.library)
+        self.client = self.app.test_client()
 
     # --- 工具 ---------------------------------------------------------
 
@@ -178,9 +187,12 @@ class PagesTest(unittest.TestCase):
     def test_import_confirm_rejects_empty_selection(self):
         token = self.token(self.upload(self.make_xlsx()))
         response = self.confirm(token, on_conflict="skip")
-        self.assertEqual(response.status_code, 302)
-        html = self.client.get(response.headers["Location"]).get_data(as_text=True)
-        self.assertIn("请至少选择一个工作表", html)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("请至少勾选一张工作表", response.get_data(as_text=True))
+        # 保留 token：用户回到预览页重新勾选后可以直接确认。
+        self.assertIn(token, import_export._pending)
+        retry = self.confirm(token, sheet_2="客户", name_2="客户")
+        self.assertEqual(retry.status_code, 302)
 
     def test_import_confirm_skip_conflict_keeps_old_table(self):
         token = self.token(self.upload(self.make_xlsx()))
@@ -225,6 +237,30 @@ class PagesTest(unittest.TestCase):
         self.assertNotIn(token, import_export._pending)
         self.assertFalse(directory.exists())
 
+    def test_import_empty_file_returns_to_upload(self):
+        empty = os.path.join(self.tmpdir, "空文件.xlsx")
+        Path(empty).write_bytes(b"")
+        response = self.upload(empty, "空文件.xlsx")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            "文件里没有可导入的数据",
+            self.client.get(response.headers["Location"]).get_data(as_text=True),
+        )
+
+    def test_import_header_only_file_returns_to_upload(self):
+        path = os.path.join(self.tmpdir, "只有表头.xlsx")
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "只有表头"
+        sheet.append(["名称", "金额"])
+        workbook.save(path)
+        response = self.upload(path, "只有表头.xlsx")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            "文件里没有可导入的数据",
+            self.client.get(response.headers["Location"]).get_data(as_text=True),
+        )
+
     def test_import_cancel_cleans_temp_files(self):
         token = self.token(self.upload(self.make_xlsx()))
         directory = Path(import_export._pending[token]["dir"])
@@ -264,6 +300,53 @@ class PagesTest(unittest.TestCase):
         self.assertTrue(response.data.startswith(b"PK"))
         with zipfile.ZipFile(io.BytesIO(response.data)) as zf:
             self.assertIn("manifest.json", zf.namelist())
+
+    def temp_dirs(self, pattern: str) -> set:
+        return set(Path(tempfile.gettempdir()).glob(pattern))
+
+    def test_export_removes_temp_dir_after_close(self):
+        before = self.temp_dirs("lsm-export-*")
+        response = self.client.get("/export/订单?format=csv")
+        self.assertTrue(response.get_data())
+        response.close()
+        self.assertEqual(self.temp_dirs("lsm-export-*") - before, set())
+
+    def test_share_export_removes_temp_dir_after_close(self):
+        before = self.temp_dirs("lsm-share-*")
+        response = self.client.get("/share/export/订单")
+        self.assertTrue(response.get_data())
+        response.close()
+        self.assertEqual(self.temp_dirs("lsm-share-*") - before, set())
+
+    def test_export_temp_dir_removed_on_real_wsgi(self):
+        """真实 WSGI 服务器（make_server）下响应结束后目录也必须消失。"""
+        before = self.temp_dirs("lsm-export-*")
+        server = make_server("127.0.0.1", 0, self.app, threaded=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=10
+            )
+            try:
+                connection.request("GET", "/export/%s?format=csv" % quote("订单"))
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
+            finally:
+                connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        leaked = self.temp_dirs("lsm-export-*") - before
+        deadline = time.time() + 5
+        while leaked and time.time() < deadline:
+            time.sleep(0.05)
+            leaked = self.temp_dirs("lsm-export-*") - before
+        self.assertEqual(leaked, set())
 
     def test_share_import_creates_new_library(self):
         package = os.path.join(self.tmpdir, "分享.lsmf")
@@ -417,6 +500,63 @@ class PagesTest(unittest.TestCase):
         blocked = self.client.delete("/api/views/%d" % view_id)
         self.assertEqual(blocked.status_code, 400)
 
+    def test_panel_save_keeps_column_widths(self):
+        created = self.client.post(
+            "/api/views", json={"table": "订单", "name": "带列宽", "config": {}}
+        )
+        view_id = created.get_json()["id"]
+        widths = self.client.post(
+            "/api/views/%d/config" % view_id, json={"widths": {"单号": 220}}
+        )
+        self.assertEqual(widths.status_code, 200)
+
+        # 面板 payload 与 views.js 一致：不带 widths。
+        panel = {
+            "filters": [{"column": "金额", "op": "gt", "value": "100"}],
+            "sorts": [{"column": "金额", "dir": "desc"}],
+            "hidden": [],
+            "order": ["单号", "金额", "状态"],
+            "group": None,
+            "aggregates": [],
+        }
+        saved = self.client.post(
+            "/api/views/%d" % view_id, json={"name": "带列宽", "config": panel}
+        )
+        self.assertEqual(saved.status_code, 200)
+        stored = json.loads(
+            self.fetch(
+                'SELECT "config_json" FROM "__lsm_view" WHERE "id" = ?', (view_id,)
+            )[0][0]
+        )
+        self.assertEqual(stored["widths"], {"单号": 220})
+        self.assertEqual(stored["filters"][0]["op"], "gt")
+
+    def test_view_config_structure_is_validated(self):
+        bad_configs = (
+            {"widths": "220"},
+            {"filters": {"column": "单号"}},
+            {"sorts": "金额"},
+            {"hidden": "单号"},
+            {"group": "状态"},
+        )
+        for config in bad_configs:
+            response = self.client.post(
+                "/api/views",
+                json={"table": "订单", "name": "坏配置", "config": config},
+            )
+            self.assertEqual(response.status_code, 400, config)
+            self.assertIn("error", response.get_json())
+        self.assertEqual(
+            self.fetch('SELECT "id" FROM "__lsm_view"'), []
+        )
+
+    def test_view_name_length_is_validated(self):
+        response = self.client.post(
+            "/api/views", json={"table": "订单", "name": "长" * 65, "config": {}}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("64", response.get_json()["error"])
+
     def test_view_default_cannot_be_deleted(self):
         response = self.client.post(
             "/api/views", json={"table": "订单", "name": "默认视图", "config": {}}
@@ -475,6 +615,27 @@ class PagesTest(unittest.TestCase):
         self.assertEqual(self.fetch('SELECT COUNT(*) FROM "订单"')[0][0], 0)
         self.assertIn("已撤销", self.client.get("/history").get_data(as_text=True))
 
+    def test_history_hides_undo_for_unregistered_kind(self):
+        self.client.post(
+            "/api/views", json={"table": "订单", "name": "历史视图", "config": {}}
+        )
+        html = self.client.get("/history").get_data(as_text=True)
+        rows_html = re.findall(r"<tr>(.*?)</tr>", html, re.S)
+        view_rows = [item for item in rows_html if "视图" in item]
+        self.assertTrue(view_rows)
+        for item in view_rows:
+            self.assertNotIn("回退", item)
+        insert_rows = [item for item in rows_html if "新增" in item]
+        self.assertTrue(any("回退" in item for item in insert_rows))
+        self.assertFalse(undo.supports("view"))
+        self.assertTrue(undo.supports("insert"))
+
+    def test_history_limit_is_clamped(self):
+        for limit in ("0", "-5", "abc", "9999"):
+            response = self.client.get("/history?limit=" + limit)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("新增", response.get_data(as_text=True))
+
     def test_history_undo_failure_flashes(self):
         op_id = self.fetch('SELECT "id" FROM "__lsm_op" ORDER BY "id" DESC')[0][0]
         self.client.post("/history/undo/%d" % op_id, data={"table": "订单"})
@@ -511,6 +672,19 @@ class PagesTest(unittest.TestCase):
             self.fetch('SELECT "deleted_at" FROM "订单" WHERE "id" = 1')[0][0]
         )
 
+    def test_restore_active_row_is_rejected(self):
+        response = self.client.post(
+            "/api/trash/restore", json={"table": "订单", "ids": [1]}
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("该行不在回收站", response.get_json()["error"])
+
+        form = self.client.post(
+            "/api/trash/restore", data={"table": "订单", "ids": ["1"]},
+            follow_redirects=True,
+        )
+        self.assertIn("该行不在回收站", form.get_data(as_text=True))
+
     def test_trash_purge_row_via_json(self):
         self.soft_delete_first()
         response = self.client.post(
@@ -519,6 +693,45 @@ class PagesTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["count"], 1)
         self.assertEqual(self.fetch('SELECT "id" FROM "订单" WHERE "id" = 1'), [])
+
+    def make_duplicate_trashed_tables(self):
+        schema.drop_table(self.library.conn, "订单")
+        self.library.conn.commit()
+        schema.create_table(
+            self.library.conn, "订单", [ColumnSpec("单号", "text")]
+        )
+        self.library.conn.commit()
+        schema.drop_table(self.library.conn, "订单")
+        self.library.conn.commit()
+
+    def test_duplicate_trashed_tables_block_purge(self):
+        self.make_duplicate_trashed_tables()
+        html = self.client.get("/trash").get_data(as_text=True)
+        self.assertIn("存在同名已删除表", html)
+        self.assertIn("同名", html)
+        purge_buttons = re.findall(
+            r"<button[^>]*button-danger[^>]*>彻底删除</button>", html
+        )
+        self.assertEqual(len(purge_buttons), 2)
+        for button in purge_buttons:
+            self.assertIn("disabled", button)
+
+        blocked = self.client.post(
+            "/api/trash/tables/purge", json={"name": "订单"}
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn("存在同名已删除表", blocked.get_json()["error"])
+
+        restored = self.client.post(
+            "/api/trash/tables/restore", json={"name": "订单"}
+        )
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(len(schema.list_trashed_tables(self.library.conn)), 1)
+        # 恢复一张后名字不再重复，剩余那张可以彻底删除。
+        purged = self.client.post("/api/trash/tables/purge", json={"name": "订单"})
+        self.assertEqual(purged.status_code, 200)
+        self.assertEqual(schema.list_trashed_tables(self.library.conn), [])
+        self.assertIn("订单", self.table_names())
 
     def test_trash_tables_restore_and_purge(self):
         schema.drop_table(self.library.conn, "订单")
