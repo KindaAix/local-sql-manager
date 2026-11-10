@@ -1,0 +1,7 @@
+<nav class="tool-nav" aria-label="工具导航">
+  <a class="tool-nav-item" href="{{ url_for('grid.index') }}">表格</a>
+  <a class="tool-nav-item{% if nav is defined and nav == 'import' %} is-active{% endif %}" href="{{ url_for('import_export.import_page') }}">导入</a>
+  <a class="tool-nav-item{% if nav is defined and nav == 'merge' %} is-active{% endif %}" href="{{ url_for('tools.merge_page') }}">合并</a>
+  <a class="tool-nav-item{% if nav is defined and nav == 'history' %} is-active{% endif %}" href="{{ url_for('history.history_page') }}">操作历史</a>
+  <a class="tool-nav-item{% if nav is defined and nav == 'trash' %} is-active{% endif %}" href="{{ url_for('trash.trash_page') }}">回收站</a>
+</nav>

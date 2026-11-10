@@ -14,11 +14,14 @@
     {% for item in views %}
     <a class="nav-item nav-sub{% if item.id == active_view.id %} is-active{% endif %}" href="{{ url_for('grid.table_view', table=table, view=item.id) }}"{% if item.id == active_view.id %} aria-current="page"{% endif %}>{{ item.name }}</a>
     {% endfor %}
+    {% if managed %}<button class="nav-item nav-add" type="button" data-open-view-panel>＋ 新建视图</button>{% endif %}
   </nav>
 </div>
 {% endif %}
 
 <div class="sidebar-section sidebar-foot">
-  <span class="nav-item is-disabled" aria-disabled="true" title="操作历史将在后续版本提供">操作历史</span>
-  <span class="nav-item is-disabled" aria-disabled="true" title="回收站将在后续版本提供">回收站</span>
+  <a class="nav-item" href="{{ url_for('import_export.import_page') }}">导入数据</a>
+  <a class="nav-item" href="{{ url_for('tools.merge_page') }}">合并数据表</a>
+  <a class="nav-item" href="{{ url_for('history.history_page', table=table) }}">操作历史</a>
+  <a class="nav-item" href="{{ url_for('trash.trash_page') }}">回收站</a>
 </div>

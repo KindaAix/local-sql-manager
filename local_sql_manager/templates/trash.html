@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}回收站 · 本地多维表格管理器{% endblock %}
+{% block body %}
+{% set nav = 'trash' %}
+<div class="tool-page">
+  {% include "_tool_nav.html" %}
+  <header class="tool-header">
+    <h1 class="tool-title">回收站</h1>
+    <p class="tool-text">这里是被删除的行与表；恢复会回到原表，彻底删除后无法撤销。</p>
+  </header>
+
+  {% for group in groups %}
+  <section class="tool-section">
+    <h2 class="tool-subtitle">{{ group.table }} <span class="form-hint">共 {{ group.total }} 行，最多显示 {{ group.shown }} 行</span></h2>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th scope="col">id</th>
+          {% for name in group.columns %}<th scope="col">{{ name }}</th>{% endfor %}
+          <th scope="col">删除时间</th>
+          <th scope="col">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in group.entries %}
+        <tr>
+          <td>{{ item.id }}</td>
+          {% for cell in item.cells %}<td>{{ cell.value|cell }}</td>{% endfor %}
+          <td class="nowrap">{{ item.deleted_at|local_time }}</td>
+          <td class="row-actions">
+            <form method="post" action="{{ url_for('trash.restore_rows_api') }}">
+              <input type="hidden" name="table" value="{{ group.table }}">
+              <input type="hidden" name="ids" value="{{ item.id }}">
+              <button class="button button-ghost button-small" type="submit">恢复</button>
+            </form>
+            <form method="post" action="{{ url_for('trash.purge_rows_api') }}" onsubmit="return confirm('彻底删除后无法恢复，确定继续吗？');">
+              <input type="hidden" name="table" value="{{ group.table }}">
+              <input type="hidden" name="ids" value="{{ item.id }}">
+              <button class="button button-ghost button-small button-danger" type="submit">彻底删除</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endfor %}
+
+  <section class="tool-section">
+    <h2 class="tool-subtitle">已删除的表</h2>
+    {% if has_duplicate_tables %}
+    <p class="form-hint warn-text">存在同名已删除表，请先恢复其中一张再处理；恢复后名字会自动加后缀。</p>
+    {% endif %}
+    {% if trashed_tables %}
+    <table class="data-table">
+      <thead><tr><th scope="col">表名</th><th scope="col">删除操作</th><th scope="col">操作</th></tr></thead>
+      <tbody>
+        {% for item in trashed_tables %}
+        <tr>
+          <td>{{ item.name }}{% if item.duplicated %} <span class="badge badge-warn">同名</span>{% endif %}</td>
+          <td>{% if item.trashed_op %}#{{ item.trashed_op }}{% else %}—{% endif %}</td>
+          <td class="row-actions">
+            <form method="post" action="{{ url_for('trash.restore_table_api') }}">
+              <input type="hidden" name="name" value="{{ item.name }}">
+              <button class="button button-ghost button-small" type="submit">恢复</button>
+            </form>
+            <form method="post" action="{{ url_for('trash.purge_table_api') }}" onsubmit="return confirm('彻底删除整张表后无法恢复，确定继续吗？');">
+              <input type="hidden" name="name" value="{{ item.name }}">
+              <button class="button button-ghost button-small button-danger" type="submit"{% if item.duplicated %} disabled title="存在同名已删除表，请先恢复其中一张"{% endif %}>彻底删除</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="form-hint">没有已删除的表。</p>
+    {% endif %}
+  </section>
+
+  {% if not groups and not trashed_tables %}
+  <p class="tool-text">回收站是空的。</p>
+  {% endif %}
+</div>
+{% endblock %}

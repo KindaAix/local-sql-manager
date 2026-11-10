@@ -355,7 +355,8 @@ class EmptyLibraryTest(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("导入 Excel", html)
         self.assertIn("还没有数据表", html)
-        self.assertIn('title="导入向导将在后续版本提供"', html)
+        # 导入向导已上线：空库入口直接链到 /import。
+        self.assertIn('href="/import"', html)
 
     def test_missing_table_in_empty_library_stays_404(self):
         response = self.client.get("/t/随便/")

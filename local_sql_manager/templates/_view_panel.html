@@ -1,0 +1,130 @@
+{% macro field_select(selected, extra) %}
+<select class="field-input vp-input" data-vp="{{ extra }}">
+  <option value="">（选择列）</option>
+  {% for field in fields %}
+  <option value="{{ field.name }}" data-type="{{ field.type }}"{% if field.name == selected %} selected{% endif %}>{{ field.name }}</option>
+  {% endfor %}
+</select>
+{% endmacro %}
+
+{% macro op_select(column, selected) %}
+{% set type = field_types.get(column, 'text') %}
+<select class="field-input vp-input" data-vp="op">
+  {% for op in ops.get(type, ops.get('text', ())) %}
+  <option value="{{ op }}"{% if op == selected %} selected{% endif %}>{{ op_labels.get(op, op) }}</option>
+  {% endfor %}
+</select>
+{% endmacro %}
+
+<aside class="view-panel" id="view-panel" hidden data-table="{{ table }}" data-view="{{ active_view.id if active_view.id is not none else '' }}">
+  <script type="application/json" id="view-panel-data">{{ panel_data|tojson }}</script>
+  <header class="vp-head">
+    <h2 class="vp-title">视图设置</h2>
+    <button class="vp-close" type="button" id="vp-close" aria-label="关闭">×</button>
+  </header>
+
+  <div class="vp-error" id="vp-error" hidden></div>
+
+  <div class="vp-body">
+    <label class="field">
+      <span class="field-label">视图名称</span>
+      <input class="field-input" type="text" id="vp-name" maxlength="64" value="{{ active_view.name if active_view.id is not none else '' }}" placeholder="例如：本月待发货">
+    </label>
+
+    {% if active_view.id is none %}
+    <p class="vp-hint">当前是默认视图，配置不会保存；请先在下方「另存为新视图」。</p>
+    {% endif %}
+
+    <section class="vp-section">
+      <h3 class="vp-subtitle">筛选</h3>
+      <div class="vp-rows" id="vp-filters">
+        {% for item in config.filters %}
+        <div class="vp-row vp-filter">
+          {{ field_select(item.column, 'column') }}
+          {{ op_select(item.column, item.op) }}
+          <input class="field-input vp-input" data-vp="value" type="text" value="{{ item.value if item.value is not none else '' }}" placeholder="值">
+          <button class="vp-remove" type="button" aria-label="删除条件">×</button>
+        </div>
+        {% endfor %}
+      </div>
+      <button class="button button-ghost button-small" type="button" data-add="filter">添加筛选</button>
+    </section>
+
+    <section class="vp-section">
+      <h3 class="vp-subtitle">排序</h3>
+      <div class="vp-rows" id="vp-sorts">
+        {% for item in config.sorts %}
+        <div class="vp-row vp-sort">
+          {{ field_select(item.column, 'column') }}
+          <select class="field-input vp-input" data-vp="dir">
+            <option value="asc"{% if item.dir != 'desc' %} selected{% endif %}>升序</option>
+            <option value="desc"{% if item.dir == 'desc' %} selected{% endif %}>降序</option>
+          </select>
+          <button class="vp-remove" type="button" aria-label="删除排序">×</button>
+        </div>
+        {% endfor %}
+      </div>
+      <button class="button button-ghost button-small" type="button" data-add="sort">添加排序</button>
+    </section>
+
+    <section class="vp-section">
+      <h3 class="vp-subtitle">隐藏列</h3>
+      <div class="vp-checks">
+        {% for field in fields %}
+        <label class="vp-check"><input type="checkbox" data-vp="hidden" value="{{ field.name }}"{% if field.name in config.hidden %} checked{% endif %}> {{ field.name }}</label>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="vp-section">
+      <h3 class="vp-subtitle">列顺序</h3>
+      <ul class="vp-order" id="vp-order">
+        {% for field in ordered_fields %}
+        <li class="vp-order-item" data-column="{{ field.name }}">
+          <span class="vp-order-name">{{ field.name }}</span>
+          <button class="vp-move" type="button" data-move="up" aria-label="上移">↑</button>
+          <button class="vp-move" type="button" data-move="down" aria-label="下移">↓</button>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="vp-section">
+      <h3 class="vp-subtitle">分组与汇总</h3>
+      <label class="field">
+        <span class="field-label">分组列</span>
+        <select class="field-input" id="vp-group">
+          <option value="">不分组</option>
+          {% for field in fields %}
+          <option value="{{ field.name }}"{% if config.group and config.group.column == field.name %} selected{% endif %}>{{ field.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="vp-rows" id="vp-aggregates">
+        {% for item in aggregate_rows %}
+        <div class="vp-row vp-agg">
+          <select class="field-input vp-input" data-vp="fn">
+            <option value="">不汇总</option>
+            {% for value, label in aggregate_labels.items() %}
+            <option value="{{ value }}"{% if item and item.fn == value %} selected{% endif %}>{{ value }}（{{ label }}）</option>
+            {% endfor %}
+          </select>
+          {{ field_select(item.column if item else '', 'agg-column') }}
+        </div>
+        {% endfor %}
+      </div>
+      <p class="vp-hint">最多 3 个汇总；分组列总排在最前。</p>
+    </section>
+  </div>
+
+  <footer class="vp-foot">
+    {% if active_view.id is not none %}
+    <button class="button" type="button" id="vp-save">保存</button>
+    <button class="button button-ghost" type="button" id="vp-copy">复制为新视图</button>
+    <button class="button button-ghost" type="button" id="vp-default"{% if active_view.is_default %} disabled{% endif %}>设为默认</button>
+    <button class="button button-ghost button-danger" type="button" id="vp-delete">删除</button>
+    {% else %}
+    <button class="button" type="button" id="vp-save-as">另存为新视图</button>
+    {% endif %}
+  </footer>
+</aside>

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, redirect, render_template, request, url_for
 
 from local_sql_manager.app import get_conn
-from local_sql_manager.services import rows, schema, views
+from local_sql_manager.services import query, rows, schema, views
 from local_sql_manager.services.models import Field
 
 bp = Blueprint("grid", __name__)
@@ -34,6 +34,22 @@ AGGREGATE_LABELS = {
     "min": "最小",
     "max": "最大",
     "count": "计数",
+}
+
+# 筛选操作符的中文名；与 services.query.OPS 的键一一对应。
+OP_LABELS = {
+    "contains": "包含",
+    "not_contains": "不包含",
+    "eq": "等于",
+    "neq": "不等于",
+    "gt": "大于",
+    "gte": "大于等于",
+    "lt": "小于",
+    "lte": "小于等于",
+    "empty": "为空",
+    "not_empty": "不为空",
+    "is_true": "已勾选",
+    "is_false": "未勾选",
 }
 
 
@@ -182,6 +198,36 @@ def _aggregate_labels(config, fields: list) -> list[str]:
     return labels
 
 
+def _ordered_fields(fields: list, config) -> list:
+    """面板里的列顺序：先按视图 order，其余按字段本身顺序补齐。"""
+    by_name = {field.name: field for field in fields}
+    ordered = []
+    seen = set()
+    for name in config.order or []:
+        field = by_name.get(name)
+        if field is None or name in seen:
+            continue
+        ordered.append(field)
+        seen.add(name)
+    ordered.extend(field for field in fields if field.name not in seen)
+    return ordered
+
+
+def _aggregate_rows(config) -> list:
+    """面板固定渲染 3 行汇总；已有配置在前，缺的用空对象占位。"""
+    existing = [item for item in config.aggregates or [] if isinstance(item, dict)][:3]
+    return existing + [{} for _ in range(3 - len(existing))]
+
+
+def _panel_data(fields: list) -> dict:
+    """给前端脚本的字段与操作符元数据（只读，不含用户数据）。"""
+    return {
+        "fields": [{"name": field.name, "type": field.type} for field in fields],
+        "ops": {key: list(value) for key, value in query.OPS.items()},
+        "op_labels": dict(OP_LABELS),
+    }
+
+
 def _group_label(value: object) -> str:
     if value is None or (isinstance(value, str) and not value.strip()):
         return "（空）"
@@ -319,4 +365,11 @@ def table_view(table: str):
         first_row=first_row,
         last_row=last_row,
         managed=_is_managed(conn, table),
+        ordered_fields=_ordered_fields(fields, config),
+        aggregate_rows=_aggregate_rows(config),
+        aggregate_labels=AGGREGATE_LABELS,
+        ops=query.OPS,
+        op_labels=OP_LABELS,
+        field_types={field.name: field.type for field in fields},
+        panel_data=_panel_data(fields),
     )

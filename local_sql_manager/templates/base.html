@@ -7,6 +7,11 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
 </head>
 <body>
+{% with messages = get_flashed_messages() %}{% if messages %}
+<div class="flash-list" role="status">
+  {% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}
+</div>
+{% endif %}{% endwith %}
 {% block body %}{% endblock %}
 </body>
 </html>

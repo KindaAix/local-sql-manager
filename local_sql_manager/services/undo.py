@@ -58,6 +58,11 @@ def unregister(kind: str) -> None:
     _HANDLERS.pop(kind, None)
 
 
+def supports(kind: str) -> bool:
+    """该 kind 是否有注册的撤销处理器；界面据此决定是否显示「回退」。"""
+    return kind in _HANDLERS
+
+
 def _quote(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
