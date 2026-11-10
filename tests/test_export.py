@@ -1,0 +1,507 @@
+"""Excel 与 CSV 导出。"""
+
+import base64
+import csv
+import io
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from openpyxl import load_workbook
+
+from local_sql_manager.services import export_excel
+from local_sql_manager.services.export_excel import (
+    export_csv,
+    export_table,
+    export_view,
+    export_workbook,
+)
+from local_sql_manager.services.library import ensure_meta
+from local_sql_manager.services.models import ViewConfig
+from local_sql_manager.services.schema import ColumnSpec, create_table
+from local_sql_manager.services.util import utcnow_iso
+
+
+class ExportTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        ensure_meta(self.conn)
+        create_table(
+            self.conn,
+            "订单",
+            [
+                ColumnSpec("名称", "text"),
+                ColumnSpec("金额", "number"),
+                ColumnSpec("状态", "select", ("新建", "完成")),
+                ColumnSpec("日期", "date"),
+            ],
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.conn.close)
+
+    def path(self, name="out.xlsx"):
+        return Path(self.tmp.name) / name
+
+    def insert(self, name, amount, status, day="2026-11-01", deleted_at=None):
+        now = utcnow_iso()
+        self.conn.execute(
+            'INSERT INTO "订单" ("created_at", "updated_at", "deleted_at",'
+            ' "名称", "金额", "状态", "日期") VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (now, now, deleted_at, name, amount, status, day),
+        )
+        self.conn.commit()
+
+    def sheet(self, path, title=None):
+        wb = load_workbook(path, read_only=True)
+        self.addCleanup(wb.close)
+        return wb[title] if title is not None else wb.worksheets[0]
+
+    def rows(self, worksheet):
+        return [list(row) for row in worksheet.iter_rows(values_only=True)]
+
+    def test_export_view_applies_filters_and_hidden_columns(self):
+        self.insert("甲", 10, "完成")
+        self.insert("乙", 20, "新建")
+        self.insert("丙", 30, "完成")
+        view = ViewConfig(
+            filters=[{"column": "状态", "op": "eq", "value": "完成"}],
+            hidden=["状态"],
+        )
+        out = export_view(self.conn, "订单", view, self.path())
+        data = self.rows(self.sheet(out))
+        self.assertNotIn("状态", data[0])
+        self.assertEqual(data[0][:2], ["名称", "金额"])
+        self.assertEqual(len(data), 3)  # 表头 + 2 条命中
+        self.assertEqual([row[0] for row in data[1:]], ["甲", "丙"])
+
+    def test_export_default_view_has_aux_columns_without_id(self):
+        self.insert("甲", 10, "完成")
+        out = export_table(self.conn, "订单", self.path())
+        header = self.rows(self.sheet(out))[0]
+        self.assertEqual(header[:4], ["名称", "金额", "状态", "日期"])
+        self.assertEqual(header[-2:], ["created_at", "updated_at"])
+        self.assertNotIn("id", header)
+        self.assertNotIn("deleted_at", header)
+
+    def test_soft_deleted_rows_are_not_exported(self):
+        self.insert("甲", 10, "完成")
+        self.insert("乙", 20, "完成", deleted_at=utcnow_iso())
+        out = export_table(self.conn, "订单", self.path())
+        data = self.rows(self.sheet(out))
+        self.assertEqual(len(data), 2)
+        self.assertEqual(data[1][0], "甲")
+
+    def test_view_order_moves_columns_to_front(self):
+        self.insert("甲", 10, "完成")
+        view = ViewConfig(order=["金额", "名称"])
+        out = export_view(self.conn, "订单", view, self.path())
+        header = self.rows(self.sheet(out))[0]
+        self.assertEqual(header[:2], ["金额", "名称"])
+        self.assertEqual(header[2:4], ["状态", "日期"])
+
+    def test_view_dict_is_accepted(self):
+        self.insert("甲", 10, "完成")
+        out = export_view(
+            self.conn, "订单", {"hidden": ["状态"]}, self.path()
+        )
+        self.assertNotIn("状态", self.rows(self.sheet(out))[0])
+
+    def test_sorting_is_applied(self):
+        for name, amount in (("甲", 10), ("乙", 30), ("丙", 20)):
+            self.insert(name, amount, "完成")
+        view = ViewConfig(sorts=[{"column": "金额", "dir": "desc"}])
+        out = export_view(self.conn, "订单", view, self.path())
+        data = self.rows(self.sheet(out))
+        self.assertEqual([row[1] for row in data[1:]], [30, 20, 10])
+
+    def test_missing_parent_directory_is_created(self):
+        self.insert("甲", 10, "完成")
+        out = export_view(
+            self.conn, "订单", None, self.path("嵌套/目录/out.xlsx")
+        )
+        self.assertTrue(out.exists())
+        self.assertIsInstance(out, Path)
+
+    def test_max_rows_raises_value_error(self):
+        for index in range(3):
+            self.insert(f"行{index}", index, "完成")
+        original = export_excel.MAX_ROWS
+        export_excel.MAX_ROWS = 2
+        self.addCleanup(setattr, export_excel, "MAX_ROWS", original)
+        with self.assertRaises(ValueError) as ctx:
+            export_table(self.conn, "订单", self.path())
+        self.assertIn("2", str(ctx.exception))
+        self.assertIn("请先筛选", str(ctx.exception))
+
+    def test_bytes_values_are_base64_encoded(self):
+        self.insert("甲", 10, "完成")
+        self.conn.execute(
+            'UPDATE "订单" SET "名称" = ?', (sqlite3.Binary(b"raw-bytes"),)
+        )
+        self.conn.commit()
+        out = export_table(self.conn, "订单", self.path())
+        self.assertEqual(
+            self.rows(self.sheet(out))[1][0], base64.b64encode(b"raw-bytes").decode()
+        )
+
+    def test_formula_like_text_stays_string(self):
+        payloads = ("=1+1", "=cmd|' /C calc'!A0")
+        for index, payload in enumerate(payloads):
+            self.insert(payload, index, "完成")
+        out = export_table(self.conn, "订单", self.path())
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        cells = [
+            row[0]
+            for row in wb["订单"].iter_rows(min_row=2, max_row=3, max_col=1)
+        ]
+        self.assertEqual([cell.value for cell in cells], list(payloads))
+        self.assertEqual([cell.data_type for cell in cells], ["s", "s"])
+
+    def test_external_table_without_metadata_is_rejected(self):
+        self.conn.execute(
+            'CREATE TABLE "外部表2" ("id" INTEGER PRIMARY KEY,'
+            ' "created_at" TEXT, "updated_at" TEXT, "甲" TEXT)'
+        )
+        out = self.path("外部.xlsx")
+        with self.assertRaises(ValueError) as ctx:
+            export_table(self.conn, "外部表2", out)
+        self.assertEqual(str(ctx.exception), "该表尚未启用编辑，无法导出")
+        self.assertFalse(out.exists())
+
+    def test_missing_table_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            export_table(self.conn, "无此表", self.path())
+        self.assertEqual(str(ctx.exception), "表不存在：无此表")
+
+    def test_internal_table_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            export_table(self.conn, "__lsm_meta", self.path())
+        self.assertIn("表不存在", str(ctx.exception))
+
+    def test_leading_space_formula_is_treated_as_text(self):
+        self.insert(" =1+1", 10, "完成")
+        out = export_table(self.conn, "订单", self.path())
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        cell = next(wb["订单"].iter_rows(min_row=2, max_row=2, max_col=1))[0]
+        self.assertEqual(cell.value, " =1+1")
+        self.assertEqual(cell.data_type, "s")
+
+        csv_path = Path(self.tmp.name) / "lead.csv"
+        export_csv(self.conn, "订单", ["名称"], csv_path)
+        lines = csv_path.read_bytes().decode("utf-8-sig").split("\r\n")
+        self.assertEqual(lines[1], "' =1+1")
+
+    def test_managed_table_without_columns_raises(self):
+        create_table(self.conn, "空表", [])
+        out = self.path("空表.xlsx")
+        with self.assertRaises(ValueError) as ctx:
+            export_table(self.conn, "空表", out)
+        self.assertEqual(str(ctx.exception), "该表没有可导出的列")
+        self.assertFalse(out.exists())
+
+    def test_group_orders_before_sorts(self):
+        self.insert("甲", 30, "完成")
+        self.insert("乙", 10, "完成")
+        self.insert("丙", 20, "新建")
+        view = ViewConfig(
+            group={"column": "状态"},
+            sorts=[{"column": "金额", "dir": "desc"}],
+        )
+        data = self.rows(self.sheet(export_view(self.conn, "订单", view, self.path())))
+        header = data[0]
+        status = header.index("状态")
+        amount = header.index("金额")
+        self.assertEqual([row[status] for row in data[1:]], ["完成", "完成", "新建"])
+        self.assertEqual([row[amount] for row in data[1:]], [30, 10, 20])
+
+    def test_equal_sort_values_keep_id_order(self):
+        self.insert("甲", 10, "完成")
+        self.insert("乙", 10, "完成")
+        view = ViewConfig(sorts=[{"column": "金额", "dir": "asc"}])
+        data = self.rows(self.sheet(export_view(self.conn, "订单", view, self.path())))
+        self.assertEqual([row[0] for row in data[1:]], ["甲", "乙"])
+
+    def test_order_duplicates_are_removed(self):
+        self.insert("甲", 10, "完成")
+        view = ViewConfig(order=["金额", "金额", "名称"])
+        header = self.rows(
+            self.sheet(export_view(self.conn, "订单", view, self.path()))
+        )[0]
+        self.assertEqual(header[:3], ["金额", "名称", "状态"])
+        self.assertEqual(header.count("金额"), 1)
+
+    def test_failed_export_keeps_existing_file(self):
+        for index in range(3):
+            self.insert(f"行{index}", index, "完成")
+        out = self.path()
+        out.write_bytes(b"old")
+        original = export_excel.MAX_ROWS
+        export_excel.MAX_ROWS = 2
+        self.addCleanup(setattr, export_excel, "MAX_ROWS", original)
+        with self.assertRaises(ValueError):
+            export_table(self.conn, "订单", out)
+        self.assertEqual(out.read_bytes(), b"old")
+
+    def test_failed_export_leaves_no_file(self):
+        for index in range(3):
+            self.insert(f"行{index}", index, "完成")
+        out = self.path()
+        original = export_excel.MAX_ROWS
+        export_excel.MAX_ROWS = 2
+        self.addCleanup(setattr, export_excel, "MAX_ROWS", original)
+        with self.assertRaises(ValueError):
+            export_table(self.conn, "订单", out)
+        self.assertFalse(out.exists())
+
+    def test_formula_like_header_stays_string(self):
+        create_table(self.conn, "公式表", [ColumnSpec("=1+1", "text")])
+        now = utcnow_iso()
+        self.conn.execute(
+            'INSERT INTO "公式表" ("created_at", "updated_at", "=1+1")'
+            " VALUES (?, ?, ?)",
+            (now, now, "值"),
+        )
+        self.conn.commit()
+        out = export_table(self.conn, "公式表", self.path())
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        header = next(wb["公式表"].iter_rows(min_row=1, max_row=1))
+        self.assertEqual(header[0].value, "=1+1")
+        self.assertEqual(header[0].data_type, "s")
+
+        csv_path = Path(self.tmp.name) / "表头.csv"
+        export_csv(self.conn, "公式表", None, csv_path)
+        first_line = csv_path.read_bytes().decode("utf-8-sig").split("\r\n")[0]
+        self.assertEqual(first_line, "'=1+1,created_at,updated_at")
+
+    def test_control_characters_are_stripped(self):
+        self.insert("a\x01b", 10, "完成")
+        data = self.rows(self.sheet(export_table(self.conn, "订单", self.path())))
+        self.assertEqual(data[1][0], "ab")
+
+        csv_path = Path(self.tmp.name) / "控制.csv"
+        export_csv(self.conn, "订单", ["名称"], csv_path)
+        lines = csv_path.read_bytes().decode("utf-8-sig").split("\r\n")
+        self.assertEqual(lines[0], "名称")
+        self.assertEqual(lines[1], "ab")
+
+
+class WorkbookTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        ensure_meta(self.conn)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.conn.close)
+
+    def make_table(self, name, extra=()):
+        create_table(self.conn, name, [ColumnSpec("名称", "text"), *extra])
+        now = utcnow_iso()
+        self.conn.execute(
+            f'INSERT INTO "{name}" ("created_at", "updated_at", "名称") VALUES (?, ?, ?)',
+            (now, now, "值"),
+        )
+        self.conn.commit()
+
+    def test_one_sheet_per_table_in_order(self):
+        self.make_table("表一")
+        self.make_table("表二")
+        out = export_workbook(
+            self.conn, ["表一", "表二"], Path(self.tmp.name) / "多表.xlsx"
+        )
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        self.assertEqual(wb.sheetnames, ["表一", "表二"])
+        header = [cell for cell in next(wb["表二"].iter_rows(values_only=True))]
+        self.assertEqual(header[0], "名称")
+
+    def test_illegal_characters_and_duplicates_are_fixed(self):
+        self.make_table("订单:明细")
+        self.make_table("订单/明细")
+        out = export_workbook(
+            self.conn, ["订单:明细", "订单/明细"], Path(self.tmp.name) / "表名.xlsx"
+        )
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        self.assertEqual(wb.sheetnames, ["订单明细", "订单明细-2"])
+
+    def test_total_row_limit_covers_whole_workbook(self):
+        self.make_table("表一")
+        self.make_table("表二")
+        original = export_excel.MAX_ROWS
+        export_excel.MAX_ROWS = 1
+        self.addCleanup(setattr, export_excel, "MAX_ROWS", original)
+        out = Path(self.tmp.name) / "超限.xlsx"
+        with self.assertRaises(ValueError):
+            export_workbook(self.conn, ["表一", "表二"], out)
+        self.assertFalse(out.exists())
+
+    def test_sheet_name_strips_apostrophes(self):
+        self.make_table("'报价'")
+        out = export_workbook(
+            self.conn, ["'报价'"], Path(self.tmp.name) / "引号.xlsx"
+        )
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        self.assertEqual(wb.sheetnames, ["报价"])
+
+    def test_sheet_name_strips_control_characters(self):
+        self.make_table("a\x01b")
+        out = export_workbook(
+            self.conn, ["a\x01b"], Path(self.tmp.name) / "控制.xlsx"
+        )
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        self.assertEqual(wb.sheetnames, ["ab"])
+
+    def test_empty_table_list_raises(self):
+        out = Path(self.tmp.name) / "空.xlsx"
+        with self.assertRaises(ValueError):
+            export_workbook(self.conn, [], out)
+        self.assertFalse(out.exists())
+
+    def test_long_sheet_name_is_truncated_to_31(self):
+        name = "很长的表名" * 8
+        self.make_table(name)
+        out = export_workbook(self.conn, [name], Path(self.tmp.name) / "长名.xlsx")
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        self.assertEqual(len(wb.sheetnames[0]), 31)
+        self.assertEqual(wb.sheetnames[0], name[:31])
+
+
+class CsvTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        ensure_meta(self.conn)
+        create_table(
+            self.conn,
+            "订单",
+            [
+                ColumnSpec("名称", "text"),
+                ColumnSpec("金额", "number"),
+                ColumnSpec("状态", "select", ("新建", "完成")),
+            ],
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.conn.close)
+
+    def insert(self, name, amount, status, deleted_at=None):
+        now = utcnow_iso()
+        self.conn.execute(
+            'INSERT INTO "订单" ("created_at", "updated_at", "deleted_at",'
+            ' "名称", "金额", "状态") VALUES (?, ?, ?, ?, ?, ?)',
+            (now, now, deleted_at, name, amount, status),
+        )
+        self.conn.commit()
+
+    def read(self, path):
+        raw = Path(path).read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+        text = raw.decode("utf-8-sig")
+        self.assertIn("\r\n", text)
+        return list(csv.reader(io.StringIO(text)))
+
+    def test_bom_and_given_column_order(self):
+        self.insert("甲", 10.5, "完成")
+        out = export_csv(
+            self.conn, "订单", ["金额", "名称"], Path(self.tmp.name) / "a.csv"
+        )
+        data = self.read(out)
+        self.assertEqual(data[0], ["金额", "名称"])
+        self.assertEqual(data[1], ["10.5", "甲"])
+
+    def test_empty_columns_falls_back_to_all_business_columns(self):
+        self.insert("甲", 10, None)
+        out = export_csv(
+            self.conn, "订单", [], Path(self.tmp.name) / "b.csv"
+        )
+        data = self.read(out)
+        self.assertEqual(data[0][:3], ["名称", "金额", "状态"])
+        self.assertEqual(data[0][-2:], ["created_at", "updated_at"])
+        self.assertEqual(data[1][2], "")  # None 写空串
+
+    def test_soft_deleted_rows_are_not_exported(self):
+        self.insert("甲", 10, "完成")
+        self.insert("乙", 20, "完成", deleted_at=utcnow_iso())
+        out = export_csv(
+            self.conn, "订单", None, Path(self.tmp.name) / "c.csv"
+        )
+        data = self.read(out)
+        self.assertEqual(len(data), 2)
+        self.assertEqual(data[1][0], "甲")
+
+    def test_formula_like_values_are_quoted(self):
+        self.insert("=1+1", -5, "完成")
+        data = self.read(
+            export_csv(self.conn, "订单", None, Path(self.tmp.name) / "f.csv")
+        )
+        record = dict(zip(data[0], data[1]))
+        self.assertEqual(record["名称"], "'=1+1")
+        self.assertFalse(record["金额"].startswith("'"))
+        self.assertEqual(record["金额"], "-5")
+
+    def test_integral_floats_render_without_decimal_point(self):
+        self.insert("整数", -5, "完成")
+        self.insert("小数", 3.14, "完成")
+        data = self.read(
+            export_csv(self.conn, "订单", ["金额"], Path(self.tmp.name) / "n.csv")
+        )
+        self.assertEqual(data[1], ["-5"])
+        self.assertEqual(data[2], ["3.14"])
+
+    def test_large_integral_floats_keep_python_notation(self):
+        self.insert("极大", 1e308, "完成")
+        self.insert("超 2^53", 1e20, "完成")
+        self.insert("负零", -0.0, "完成")
+        data = self.read(
+            export_csv(self.conn, "订单", ["金额"], Path(self.tmp.name) / "big.csv")
+        )
+        self.assertEqual(data[1], ["1e+308"])
+        self.assertEqual(data[2], ["1e+20"])
+        self.assertEqual(data[3], ["0"])
+
+    def test_all_formula_prefixes_are_quoted(self):
+        values = ("+1", "-1", "@SUM(A1)", "\t=1")
+        for index, value in enumerate(values):
+            self.insert(value, index, "完成")
+        data = self.read(
+            export_csv(self.conn, "订单", None, Path(self.tmp.name) / "g.csv")
+        )
+        self.assertEqual([row[0] for row in data[1:]], ["'" + v for v in values])
+
+    def test_special_characters_roundtrip(self):
+        tricky = '逗号, 引号" 和\n换行'
+        self.insert(tricky, 1, "完成")
+        data = self.read(
+            export_csv(self.conn, "订单", ["名称"], Path(self.tmp.name) / "s.csv")
+        )
+        self.assertEqual(data[1][0], tricky)
+
+    def test_internal_columns_are_ignored(self):
+        self.insert("甲", 10, "完成")
+        out = export_csv(
+            self.conn,
+            "订单",
+            ["id", "名称", "deleted_at"],
+            Path(self.tmp.name) / "i.csv",
+        )
+        data = self.read(out)
+        self.assertEqual(data[0], ["名称"])
+        self.assertEqual(data[1], ["甲"])
+
+    def test_empty_selection_raises(self):
+        self.insert("甲", 10, "完成")
+        out = Path(self.tmp.name) / "empty.csv"
+        with self.assertRaises(ValueError) as ctx:
+            export_csv(self.conn, "订单", ["不存在"], out)
+        self.assertEqual(str(ctx.exception), "没有可导出的列")
+        self.assertFalse(out.exists())
