@@ -1,21 +1,25 @@
-"""Excel 多 sheet 解析与导入。
+"""Excel / CSV 多 sheet 解析与导入。
 
-parse_workbook 只读地读出每个 sheet 的预览（列名、行数、前 5 行样本、推断
-类型、可疑列），供导入界面勾选；import_sheets 在调用方的事务里建表并分批
-写入，成功后记一条 kind="import" 的审计，不自行提交。
+parse_workbook 只读地读出可导入对象的预览（列名、行数、前 5 行样本、推断
+类型、可疑列），CSV 视为只有一个 sheet（名字取文件 stem）；import_sheets
+在调用方的事务里建表并分批写入，成功后记一条 kind="import" 的审计，不
+自行提交。
 
 类型推断沿用 services.types.infer_type，口径固定为：纯 YYYY-MM-DD 才算
 date，带时分秒一律按 text；带前导零一律 text；单选（select）不自动判定。
+推断只看每个 sheet 的前 INFER_SAMPLE_ROWS 行，导入本身仍处理全部行。
 """
 
 from __future__ import annotations
 
+import csv
 import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
-from typing import Iterator, Sequence
+from pathlib import Path
+from typing import Callable, Iterator, Sequence
 
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
@@ -31,6 +35,9 @@ BATCH_SIZE = 500
 # 预览里展示的样本行数。
 SAMPLE_ROWS = 5
 
+# 类型推断的取样行数：超出的行照常导入，只是不参与推断。
+INFER_SAMPLE_ROWS = 5000
+
 # 导入与预览都来自界面，MCP 若需区分可后续加 source 参数。
 _SOURCE = "web"
 
@@ -42,7 +49,7 @@ _RESERVED_PREFIXES = ("__lsm_", "sqlite_")
 
 @dataclass
 class SheetPreview:
-    """一个 sheet 的导入预览。"""
+    """一个可导入 sheet 的预览。sampled 表示类型只按前 5000 行推断。"""
 
     name: str
     columns: list[str] = field(default_factory=list)
@@ -51,6 +58,16 @@ class SheetPreview:
     types: dict[str, str] = field(default_factory=dict)
     suspicious: list[str] = field(default_factory=list)
     empty: bool = True
+    sampled: bool = False
+
+
+@dataclass
+class _Sheet:
+    """统一的 sheet 数据源；rows 每次调用都从头迭代。"""
+
+    name: str
+    columns: list[str]
+    rows: Callable[[], Iterator[list[str]]]
 
 
 def _quote(name: str) -> str:
@@ -110,26 +127,70 @@ def _row_values(raw: Sequence[object], width: int) -> list[str]:
     return texts
 
 
-def _open_sheet(worksheet) -> tuple[list[str], Iterator[list[str]]]:
-    """返回 (消歧后的列名, 数据行迭代器)；数据行已转成文本并跳过空行。"""
-    iterator = worksheet.iter_rows(values_only=True)
-    for raw in iterator:
+def _worksheet_sheet(worksheet) -> _Sheet:
+    """把 openpyxl 工作表包成可反复迭代的 _Sheet。"""
+    columns: list[str] = []
+    for raw in worksheet.iter_rows(values_only=True):
         if _is_blank_row(raw):
             continue
         columns = _header_names(raw)
         break
-    else:
-        return [], iter(())
-
-    width = len(columns)
 
     def rows() -> Iterator[list[str]]:
-        for raw in iterator:
+        if not columns:
+            return
+        width = len(columns)
+        header_seen = False
+        for raw in worksheet.iter_rows(values_only=True):
             if _is_blank_row(raw):
+                continue
+            if not header_seen:
+                header_seen = True
                 continue
             yield _row_values(raw, width)
 
-    return columns, rows()
+    return _Sheet(worksheet.title, columns, rows)
+
+
+def _is_csv(path) -> bool:
+    return str(path).lower().endswith(".csv")
+
+
+def _read_csv_header(path) -> list[str]:
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        for raw in csv.reader(handle):
+            if _is_blank_row(raw):
+                continue
+            return _header_names(raw)
+    return []
+
+
+def _csv_sheet(path) -> _Sheet:
+    """CSV 只有一个 sheet，名字取文件 stem；utf-8-sig 兼容带 BOM 的文件。"""
+    try:
+        columns = _read_csv_header(path)
+    except OSError as exc:
+        raise ValueError(f"无法读取文件：{exc}") from exc
+
+    def rows() -> Iterator[list[str]]:
+        if not columns:
+            return
+        width = len(columns)
+        try:
+            handle = open(path, "r", encoding="utf-8-sig", newline="")
+        except OSError as exc:
+            raise ValueError(f"无法读取文件：{exc}") from exc
+        with handle:
+            header_seen = False
+            for raw in csv.reader(handle):
+                if _is_blank_row(raw):
+                    continue
+                if not header_seen:
+                    header_seen = True
+                    continue
+                yield _row_values(raw, width)
+
+    return _Sheet(Path(path).stem, columns, rows)
 
 
 def _open_workbook(path):
@@ -138,49 +199,53 @@ def _open_workbook(path):
     try:
         return load_workbook(filename=str(path), read_only=True, data_only=True)
     except (InvalidFileException, OSError) as exc:
-        raise ValueError(f"无法读取工作簿：{exc}") from exc
+        raise ValueError(f"无法读取文件：{exc}") from exc
 
 
-def _preview_sheet(worksheet) -> SheetPreview:
-    columns, rows = _open_sheet(worksheet)
-    if not columns:
-        return SheetPreview(name=worksheet.title)
+def _preview(sheet: _Sheet) -> SheetPreview:
+    if not sheet.columns:
+        return SheetPreview(name=sheet.name)
 
-    values: list[list[str]] = [[] for _ in columns]
+    values: list[list[str]] = [[] for _ in sheet.columns]
     sample: list[list[str]] = []
     row_count = 0
-    for row in rows:
+    for row in sheet.rows():
         row_count += 1
         if len(sample) < SAMPLE_ROWS:
             sample.append(row)
-        for index, text in enumerate(row):
-            if text:
-                values[index].append(text)
+        if row_count <= INFER_SAMPLE_ROWS:
+            for index, text in enumerate(row):
+                if text:
+                    values[index].append(text)
 
     types: dict[str, str] = {}
     suspicious: list[str] = []
-    for column, column_values in zip(columns, values):
+    for column, column_values in zip(sheet.columns, values):
         type_, odd = infer_type(column_values)
         types[column] = type_
         if odd:
             suspicious.append(column)
 
     return SheetPreview(
-        name=worksheet.title,
-        columns=columns,
+        name=sheet.name,
+        columns=list(sheet.columns),
         row_count=row_count,
         sample=sample,
         types=types,
         suspicious=suspicious,
         empty=False,
+        sampled=row_count > INFER_SAMPLE_ROWS,
     )
 
 
 def parse_workbook(path) -> list[SheetPreview]:
-    """解析工作簿的每个 sheet，顺序与工作簿一致。"""
+    """解析 xlsx 的每个 sheet，或单个 CSV；顺序与文件一致。"""
+    if _is_csv(path):
+        return [_preview(_csv_sheet(path))]
+
     workbook = _open_workbook(path)
     try:
-        return [_preview_sheet(worksheet) for worksheet in workbook.worksheets]
+        return [_preview(_worksheet_sheet(worksheet)) for worksheet in workbook.worksheets]
     finally:
         workbook.close()
 
@@ -243,29 +308,29 @@ def _plan_table(
     }
 
 
-def _resolve_types(
-    sheet_name: str,
-    columns: list[str],
-    worksheet,
-    overrides: dict,
-) -> dict[str, str]:
-    """合并手动指定的类型与推断类型；未指定的列用整列数据推断。"""
-    given = overrides.get(sheet_name) or {}
+def _resolve_types(sheet: _Sheet, overrides: dict) -> dict[str, str]:
+    """合并手动指定的类型与推断类型；未指定的列推断前 5000 行。"""
+    given = overrides.get(sheet.name) or {}
     for column, type_ in given.items():
-        if column not in columns:
-            raise ValueError(f"工作表 {sheet_name} 没有列：{column}")
+        if column not in sheet.columns:
+            raise ValueError(f"工作表 {sheet.name} 没有列：{column}")
         if type_ not in TYPES:
             raise ValueError(f"未知字段类型：{type_}")
 
-    types = {column: given[column] for column in columns if column in given}
-    missing = [column for column in columns if column not in given]
+    types = {column: given[column] for column in sheet.columns if column in given}
+    missing = [column for column in sheet.columns if column not in given]
     if not missing:
         return types
 
     values: dict[str, list[str]] = {column: [] for column in missing}
-    _, rows = _open_sheet(worksheet)
-    indexes = {column: index for index, column in enumerate(columns) if column in values}
-    for row in rows:
+    indexes = {
+        column: index
+        for index, column in enumerate(sheet.columns)
+        if column in values
+    }
+    for position, row in enumerate(sheet.rows()):
+        if position >= INFER_SAMPLE_ROWS:
+            break
         for column, index in indexes.items():
             if row[index]:
                 values[column].append(row[index])
@@ -339,9 +404,10 @@ def import_sheets(
 ) -> list[str]:
     """把选中的 sheet 各建成一张新表，返回新建的表名（按处理顺序）。
 
-    on_conflict：overwrite 把同名旧表移入回收站后重建；copy 新建带后缀的
-    副本；skip 跳过同名表。空 sheet 直接跳过。整批一个事务，任一步失败
-    全部回滚；成功后记一条 kind="import" 的审计。
+    支持 .xlsx（多 sheet）与 .csv（单 sheet，名字取文件 stem）。on_conflict：
+    overwrite 把同名旧表移入回收站后重建；copy 新建带后缀的副本；skip 跳过
+    同名表。空 sheet 直接跳过。整批一个事务，任一步失败全部回滚；成功后记
+    一条 kind="import" 的审计。
     """
     if on_conflict not in ("overwrite", "copy", "skip"):
         raise ValueError(f"未知的同名处理方式：{on_conflict}")
@@ -356,31 +422,37 @@ def import_sheets(
     created: list[str] = []
     details: list[dict] = []
     filename = os.path.basename(str(path))
-    workbook = _open_workbook(path)
+
+    workbook = None
+    if _is_csv(path):
+        sheets = {sheet.name: sheet for sheet in [_csv_sheet(path)]}
+    else:
+        workbook = _open_workbook(path)
+        sheets = {
+            worksheet.title: _worksheet_sheet(worksheet)
+            for worksheet in workbook.worksheets
+        }
+
     try:
-        sheets = {worksheet.title: worksheet for worksheet in workbook.worksheets}
         with _import_txn(conn):
             for sheet_name in selected:
-                worksheet = sheets.get(sheet_name)
-                if worksheet is None:
-                    raise ValueError(f"工作簿中没有工作表：{sheet_name}")
-                columns, rows = _open_sheet(worksheet)
-                if not columns:
+                sheet = sheets.get(sheet_name)
+                if sheet is None:
+                    raise ValueError(f"文件里没有工作表：{sheet_name}")
+                if not sheet.columns:
                     continue
-                column_types = _resolve_types(
-                    sheet_name, columns, worksheet, overrides
-                )
+                column_types = _resolve_types(sheet, overrides)
                 table, overwritten = _plan_table(conn, sheet_name, on_conflict)
                 if table is None:
                     continue
                 create_table(
                     conn,
                     table,
-                    [ColumnSpec(column, column_types[column]) for column in columns],
+                    [ColumnSpec(column, column_types[column]) for column in sheet.columns],
                     source_file=filename,
                 )
                 row_count = _insert_rows(
-                    conn, table, columns, column_types, rows
+                    conn, table, list(sheet.columns), column_types, sheet.rows()
                 )
                 created.append(table)
                 details.append(
@@ -409,5 +481,6 @@ def import_sheets(
                     {"file": filename, "tables": list(created), "sheets": details},
                 )
     finally:
-        workbook.close()
+        if workbook is not None:
+            workbook.close()
     return created

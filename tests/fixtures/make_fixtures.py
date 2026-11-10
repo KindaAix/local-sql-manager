@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import csv
 from datetime import date, datetime
 
 from openpyxl import Workbook
@@ -72,4 +73,22 @@ def make_reserved_workbook(path):
     sheet.append(["值"])
     sheet.append(["x"])
     workbook.save(path)
+    return path
+
+def make_csv(path):
+    """单 sheet 的 CSV：前导零列与数字列。"""
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["名称", "金额", "编码"])
+        writer.writerow(["张三", "12.5", "007"])
+        writer.writerow(["李四", "20", "012"])
+    return path
+
+
+def make_csv_bom_dup(path):
+    """带 BOM 且第 1、2 列同名的 CSV。"""
+    with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["金额", "金额", "名称"])
+        writer.writerow(["10", "20", "测试"])
     return path

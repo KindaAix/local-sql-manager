@@ -21,6 +21,8 @@ from local_sql_manager.services.schema import (
 )
 from tests.fixtures.make_fixtures import (
     make_bad_workbook,
+    make_csv,
+    make_csv_bom_dup,
     make_dup_workbook,
     make_large_workbook,
     make_reserved_workbook,
@@ -66,6 +68,12 @@ class TestParseWorkbook(ImportTestCase):
         self.assertEqual(preview.row_count, 2)
         self.assertEqual(preview.sample[0][0], "007")
         self.assertEqual(len(preview.sample), 2)
+
+    def test_preview_marks_sampling_beyond_5000_rows(self):
+        path = self.make("大表.xlsx", lambda target: make_large_workbook(target, 5200))
+        preview = parse_workbook(path)[0]
+        self.assertEqual(preview.row_count, 5200)
+        self.assertTrue(preview.sampled)
 
     def test_empty_preview_has_no_columns(self):
         preview = parse_workbook(self.make("订单.xlsx", make_workbook))[1]
@@ -246,7 +254,7 @@ class TestImportSheets(ImportTestCase):
         self.assertEqual(list_tables(self.conn), [])
 
     def test_missing_file_is_reported_in_chinese(self):
-        with self.assertRaisesRegex(ValueError, "无法读取工作簿"):
+        with self.assertRaisesRegex(ValueError, "无法读取文件"):
             import_sheets(
                 self.conn,
                 os.path.join(self.tmp.name, "不存在.xlsx"),
@@ -254,6 +262,17 @@ class TestImportSheets(ImportTestCase):
                 {},
                 "skip",
             )
+
+    def test_large_sheet_beyond_inference_sample_still_imports(self):
+        path = self.make("大表.xlsx", lambda target: make_large_workbook(target, 5200))
+        created = import_sheets(self.conn, path, ["大表"], {}, "skip")
+        self.assertEqual(created, ["大表"])
+        count = self.conn.execute('SELECT COUNT(*) FROM "大表"').fetchone()[0]
+        self.assertEqual(count, 5200)
+        self.assertEqual(
+            self.conn.execute('SELECT "名称" FROM "大表" ORDER BY "id" DESC LIMIT 1').fetchone()[0],
+            "名称5200",
+        )
 
     def test_invalid_conflict_mode_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -329,3 +348,36 @@ class TestSanitize(unittest.TestCase):
         name = _sanitize_table_name("__lsm_x")
         self.assertFalse(name.lower().startswith("__lsm_"))
         self.assertEqual(_sanitize_table_name("sqlite_x"), "_sqlite_x")
+
+class TestCsv(ImportTestCase):
+    def test_csv_preview_uses_file_stem_and_infers_types(self):
+        previews = parse_workbook(self.make("客户.csv", make_csv))
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(previews[0].name, "客户")
+        self.assertEqual(previews[0].columns, ["名称", "金额", "编码"])
+        self.assertEqual(previews[0].types["编码"], "text")
+        self.assertEqual(previews[0].types["金额"], "number")
+        self.assertEqual(previews[0].row_count, 2)
+        self.assertFalse(previews[0].sampled)
+
+    def test_csv_import_creates_single_table(self):
+        created = import_sheets(
+            self.conn, self.make("客户.csv", make_csv), ["客户"], {}, "skip"
+        )
+        self.assertEqual(created, ["客户"])
+        row = self.rows("客户")[0]
+        self.assertEqual(row["编码"], "007")
+        self.assertEqual(row["金额"], 12.5)
+        self.assertEqual(list_tables(self.conn), ["客户"])
+
+    def test_csv_with_bom_and_duplicate_columns(self):
+        path = self.make("重复.csv", make_csv_bom_dup)
+        preview = parse_workbook(path)[0]
+        self.assertEqual(preview.columns, ["金额", "金额_2", "名称"])
+        created = import_sheets(self.conn, path, ["重复"], {}, "skip")
+        self.assertEqual(created, ["重复"])
+        self.assertEqual(
+            [field.name for field in get_fields(self.conn, "重复")],
+            ["金额", "金额_2", "名称"],
+        )
+        self.assertEqual(self.rows("重复")[0]["名称"], "测试")
