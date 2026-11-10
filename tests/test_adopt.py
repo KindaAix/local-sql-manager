@@ -3,6 +3,7 @@ import unittest
 from unittest import mock
 
 from local_sql_manager.services import adopt as adopt_service
+from local_sql_manager.services import schema as schema_service
 from local_sql_manager.services.adopt import adopt_table, check_adoptable
 from local_sql_manager.services.audit import get_op, history
 from local_sql_manager.services.library import ensure_meta
@@ -476,7 +477,7 @@ class TestReviewFixes(BaseAdoptTestCase):
         self.assertIn("3 行", reason)
         self.assertIn("未删除", reason)
 
-        adopt_table(self.conn, "s")
+        op = adopt_table(self.conn, "s")
         self.assertEqual(get_page(self.conn, "s", ViewConfig()).total, 3)
         values = [
             row[0]
@@ -487,6 +488,10 @@ class TestReviewFixes(BaseAdoptTestCase):
             row["name"]: row for row in self.execute('PRAGMA table_info("s")')
         }
         self.assertIsNone(info["deleted_at"]["dflt_value"])
+
+        payload = get_op(self.conn, op)["payload"]
+        self.assertEqual(payload["sentinel_count"], 3)
+        self.assertEqual(payload["sentinel_rule"], "deleted_at_sentinel_v1")
 
         self.execute("INSERT INTO s (v) VALUES ('d')")
         self.assertEqual(get_page(self.conn, "s", ViewConfig()).total, 4)
@@ -595,23 +600,33 @@ class TestReviewFixes(BaseAdoptTestCase):
         self.assertTrue(ok)
         self.assertIn("ON CONFLICT", reason)
 
-    def test_missing_metadata_rolls_back_rebuild(self):
+    def test_missing_metadata_is_rejected(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         ensure_meta(conn)
         conn.execute('DROP TABLE "__lsm_table"')
         conn.execute('CREATE TABLE legacy ("名称" TEXT)')
         conn.execute("INSERT INTO legacy VALUES ('a')")
+        ok, reason = check_adoptable(conn, "legacy")
+        self.assertFalse(ok)
+        self.assertIn("元数据", reason)
         with self.assertRaises(AdoptError):
             adopt_table(conn, "legacy")
         cols = [row["name"] for row in conn.execute('PRAGMA table_info("legacy")')]
         self.assertEqual(cols, ["名称"])
-        self.assertIsNone(
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE name = ?",
-                (adopt_service.TEMP_TABLE,),
-            ).fetchone()
-        )
+        conn.close()
+
+    def test_missing_op_table_is_rejected(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ensure_meta(conn)
+        conn.execute('DROP TABLE "__lsm_op"')
+        conn.execute('CREATE TABLE legacy ("名称" TEXT)')
+        ok, reason = check_adoptable(conn, "legacy")
+        self.assertFalse(ok)
+        self.assertIn("元数据", reason)
+        with self.assertRaises(AdoptError):
+            adopt_table(conn, "legacy")
         conn.close()
 
     def test_registered_trashed_table_is_not_adoptable(self):
@@ -624,6 +639,114 @@ class TestReviewFixes(BaseAdoptTestCase):
         ok, reason = check_adoptable(self.conn, "legacy")
         self.assertFalse(ok)
         self.assertIn("已启用", reason)
+
+
+    def test_sentinel_whitespace_zero_and_zero_date(self):
+        self.execute(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY,"
+            " deleted_at TEXT DEFAULT '', v TEXT)"
+        )
+        rows = [
+            ("\t", "a"),
+            ("\n ", "b"),
+            ("0.0", "c"),
+            ("0000-00-00 00:00:00", "d"),
+            (" 0 ", "e"),
+        ]
+        for index, (sentinel, value) in enumerate(rows, 1):
+            self.execute(
+                "INSERT INTO s (id, deleted_at, v) VALUES (?, ?, ?)",
+                (index, sentinel, value),
+            )
+        ok, reason = check_adoptable(self.conn, "s")
+        self.assertTrue(ok)
+        self.assertIn("5 行", reason)
+        op = adopt_table(self.conn, "s")
+        self.assertEqual(get_page(self.conn, "s", ViewConfig()).total, 5)
+        values = [
+            row[0] for row in self.execute("SELECT deleted_at FROM s").fetchall()
+        ]
+        self.assertEqual(values, [None] * 5)
+        self.assertEqual(get_op(self.conn, op)["payload"]["sentinel_count"], 5)
+
+    def test_sentinel_real_zero_is_normalized(self):
+        self.execute(
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, deleted_at REAL DEFAULT 0, v TEXT)"
+        )
+        self.execute("INSERT INTO r (id, deleted_at, v) VALUES (1, 0.0, 'a')")
+        ok, reason = check_adoptable(self.conn, "r")
+        self.assertTrue(ok)
+        self.assertIn("1 行", reason)
+        adopt_table(self.conn, "r")
+        self.assertIsNone(
+            self.execute("SELECT deleted_at FROM r WHERE id = 1").fetchone()[0]
+        )
+        self.assertEqual(get_page(self.conn, "r", ViewConfig()).total, 1)
+
+    def test_strict_table_non_text_aux_rejected(self):
+        self.execute(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY,"
+            " deleted_at INTEGER DEFAULT 0, v TEXT) STRICT"
+        )
+        ok, reason = check_adoptable(self.conn, "s")
+        self.assertFalse(ok)
+        self.assertIn("STRICT", reason)
+        self.assertIn("TEXT", reason)
+
+    def test_reason_mentions_collation_loss(self):
+        self.execute("CREATE TABLE l (v TEXT)")
+        ok, reason = check_adoptable(self.conn, "l")
+        self.assertTrue(ok)
+        self.assertIn("COLLATE", reason)
+
+    def test_rename_with_reference_and_broken_view_is_rejected(self):
+        self.execute("CREATE TABLE t (a TEXT)")
+        self.execute("CREATE TABLE other (x TEXT)")
+        self.execute(
+            "CREATE TRIGGER other_ai AFTER INSERT ON other"
+            " BEGIN INSERT INTO t (a) VALUES (new.x); END"
+        )
+        self.execute("CREATE VIEW broken AS SELECT * FROM nope")
+        with self.assertRaises(ValueError) as ctx:
+            rename_table(self.conn, "t", "t2")
+        self.assertIn("引用", str(ctx.exception))
+        self.assertIn("t", list_tables(self.conn))
+        self.assertNotIn("t2", list_tables(self.conn))
+        self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 0)
+
+    def test_rename_uses_modern_when_connection_legacy_on(self):
+        self.execute("PRAGMA legacy_alter_table=1")
+        self.execute("CREATE TABLE t (a TEXT)")
+        self.execute("CREATE VIEW v AS SELECT a FROM t")
+        self.execute("INSERT INTO t (a) VALUES ('x')")
+        rename_table(self.conn, "t", "t2")
+        self.assertEqual(self.execute("SELECT a FROM v").fetchone()[0], "x")
+        self.assertIn("t2", self.object_sql("v"))
+        self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 1)
+
+    def test_sql_reference_detection_rules(self):
+        self.assertFalse(
+            schema_service._sql_references_table(
+                "CREATE VIEW v AS SELECT 't' AS x", "t"
+            )
+        )
+        self.assertTrue(
+            schema_service._sql_references_table(
+                'CREATE VIEW v AS SELECT * FROM "T"', "t"
+            )
+        )
+        self.assertTrue(
+            schema_service._sql_references_table(
+                "CREATE TRIGGER x AFTER INSERT ON o"
+                " BEGIN INSERT INTO main.t VALUES (1); END",
+                "t",
+            )
+        )
+        self.assertFalse(
+            schema_service._sql_references_table(
+                "CREATE VIEW v AS SELECT * FROM t2", "t"
+            )
+        )
 
 
 if __name__ == "__main__":

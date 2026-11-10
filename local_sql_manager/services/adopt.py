@@ -32,9 +32,33 @@ AUX_NAMES = ("id", "created_at", "updated_at", "deleted_at")
 
 _CREATED_AT_DEFAULT = "DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
 
+# deleted_at 里常见的「未删除」哨兵值；重建时统一归一化为 NULL。
+SENTINEL_RULE = "deleted_at_sentinel_v1"
+SENTINEL_VALUES = (
+    "",
+    "0",
+    "0.0",
+    "false",
+    "no",
+    "n",
+    "0000-00-00",
+    "0000-00-00 00:00:00",
+)
+# SQLite 的 trim 默认只去空格；这里把 ASCII 空白字符集交给 trim，等价于
+# Python 的 strip（只去两端，不误伤内部的空白/单词）。
+_WHITESPACE_CHARS = (
+    "char(32) || char(9) || char(10) || char(11) || char(12) || char(13)"
+)
+_SENTINEL_IN = ", ".join(f"'{value}'" for value in SENTINEL_VALUES)
+
 
 def _quote(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
+
+
+def _normalized_text(name: str) -> str:
+    """把列转成文本、去两端空白并小写，用于 deleted_at 哨兵判断。"""
+    return f"lower(trim(CAST({_quote(name)} AS TEXT), {_WHITESPACE_CHARS}))"
 
 
 @dataclass
@@ -339,6 +363,9 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
     """校验并生成重建计划；不满足条件时抛 AdoptError。"""
     if str(table).lower().startswith(("__lsm_", "sqlite_")):
         raise AdoptError(f"不能对内部表启用编辑：{table}")
+    for meta in ("__lsm_table", "__lsm_op"):
+        if not _has_table(conn, meta):
+            raise AdoptError(f"库缺少元数据表 {meta}，无法启用编辑")
     resolved, kind, create_sql = _resolve(conn, table)
     if kind == "view":
         raise AdoptError("视图不能启用编辑")
@@ -446,11 +473,19 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
         sentinel_count = conn.execute(
             f"SELECT COUNT(*) FROM {_quote(resolved)}"
             f" WHERE {_quote(deleted_column.name)} IS NOT NULL"
-            f" AND lower(trim(CAST({_quote(deleted_column.name)} AS TEXT)))"
-            " IN ('', '0', 'false', 'no', 'n')"
+            f" AND {_normalized_text(deleted_column.name)}"
+            f" IN ({_SENTINEL_IN})"
         ).fetchone()[0]
     fk_before = len(conn.execute("PRAGMA foreign_key_check").fetchall())
     strict = bool(create_sql and re.search(r"\)\s*STRICT\s*$", create_sql, re.I))
+    if strict:
+        for name in ("created_at", "updated_at", "deleted_at"):
+            column = by_name.get(name)
+            if column is not None and column.type.strip().upper() != "TEXT":
+                raise AdoptError(
+                    f"STRICT 表的 {name} 列必须是 TEXT（当前为"
+                    f" {column.type or '无类型'}），无法启用编辑"
+                )
 
     parts = []
     if pk is None:
@@ -474,12 +509,14 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
         parts.append("重建后补建各列普通索引")
     if sentinel_count:
         parts.append(
-            f"已有 {sentinel_count} 行 deleted_at 为空串/0，重建后视为未删除"
+            f"已有 {sentinel_count} 行 deleted_at 为空串、0（含 0.0）、false、"
+            "no、n、零日期或纯空白，重建后视为未删除"
         )
     if create_sql and re.search(r"\bON\s+CONFLICT\b", create_sql, re.I):
         parts.append(
             "原表 UNIQUE 的 ON CONFLICT 策略无法用唯一索引表达，重建后冲突处理回到默认"
         )
+    parts.append("列级 COLLATE 不会保留，比较与排序将按默认规则")
 
     checks = _check_constraints(create_sql)
     if renamed_pk:
@@ -608,8 +645,8 @@ def _build_columns(plan: _Plan) -> tuple[list[str], list[str], list[str], list[A
         insert_columns.append('"deleted_at"')
         select_expressions.append(
             f'CASE WHEN {_quote(column.name)} IS NULL THEN NULL'
-            f" WHEN lower(trim(CAST({_quote(column.name)} AS TEXT)))"
-            " IN ('', '0', 'false', 'no', 'n') THEN NULL"
+            f" WHEN {_normalized_text(column.name)} IN ({_SENTINEL_IN})"
+            " THEN NULL"
             f" ELSE {_quote(column.name)} END"
         )
 
@@ -716,6 +753,8 @@ def _payload(plan: _Plan) -> dict:
         ],
         "indexes": [index.name for index in plan.indexes],
         "row_count": plan.row_count,
+        "sentinel_count": plan.sentinel_count,
+        "sentinel_rule": SENTINEL_RULE,
         "triggers": list(plan.triggers),
     }
 
