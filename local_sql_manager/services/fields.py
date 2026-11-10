@@ -10,9 +10,9 @@
 - 删列前先把非空值按 (row_id, value) 备份进 __lsm_trash_col；value 用 JSON
   文本存储，bytes 编成 {"b64": ...}，与审计 payload 同一约定。备份完之后才
   删索引、删列、删元数据、清理视图引用。
-- 改类型只动 __lsm_field，不重建物理列。读取/筛选/排序/汇总按逻辑类型
-  CAST 是层 2（query/rows）的职责，目前尚未实现，所以改类型只影响元数据与
-  之后的界面展示。
+- 改类型只动 __lsm_field，不重建物理列：读取与排序尚未按逻辑类型 CAST
+  （层 2 的 query/rows 待补），筛选对 number/date 已经 CAST（query._clause），
+  所以改类型目前只影响元数据、之后的写入与筛选。
 - 四个操作都只写审计、不 commit。删列的撤销处理器返回描述动作的简要
   payload；字段动作暂不支持「撤销的撤销」（层 3 的 undo 只认识表级动作，
   要重做需要 undo 开放 action 分派扩展点，等层 7 统一处理）。
@@ -324,6 +324,22 @@ def _pop_view_refs(config: dict, column: str) -> dict | None:
     return removed if changed else None
 
 
+def _ref_item(entry):
+    """取回被摘掉的条目：新格式是 {"index", "item"}，旧格式直接是条目本身。"""
+    if isinstance(entry, dict) and "item" in entry:
+        return entry.get("item")
+    return entry
+
+
+def _ref_index(entry) -> int:
+    """条目原来的位置；旧格式没有记录，回退到 0（放在最前面）。"""
+    if isinstance(entry, dict):
+        value = entry.get("index")
+        if isinstance(value, int):
+            return value
+    return 0
+
+
 def _restore_view_refs(config: dict, column: str, refs: dict) -> bool:
     """把 _pop_view_refs 摘掉的条目放回去；列已存在时跳过，避免重复。"""
     changed = False
@@ -341,9 +357,11 @@ def _restore_view_refs(config: dict, column: str, refs: dict) -> bool:
             continue
         if key in _ORDERED_ITEMS:
             # 插回原来的位置，否则删中间一项再撤销会静默改变排序优先级。
-            for entry in sorted(items, key=lambda item: item.get("index") or 0):
-                index = min(int(entry.get("index") or 0), len(current))
-                current.insert(index, entry.get("item"))
+            for entry in sorted(items, key=_ref_index):
+                item = _ref_item(entry)
+                if not isinstance(item, dict):
+                    continue
+                current.insert(min(_ref_index(entry), len(current)), item)
         else:
             current = current + list(items)
         config[key] = current

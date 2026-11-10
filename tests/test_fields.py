@@ -654,6 +654,37 @@ class TestUndoDropField(BaseFieldCase):
             [item["column"] for item in config.aggregates], ["备注", "金额", "状态"]
         )
 
+    def test_undo_accepts_legacy_view_refs_payload(self):
+        # 旧版本 payload 里 sorts/aggregates 直接是条目本身，没有 index/item 包装。
+        view_id = self.add_view(
+            ViewConfig(
+                sorts=[{"column": "金额", "dir": "desc"}],
+                aggregates=[{"column": "金额", "fn": "sum"}],
+            )
+        )
+        op = fields.drop_field(self.conn, "订单", "金额")
+        payload = dict(self.op(op)["payload"])
+        refs = []
+        for entry in payload["view_refs"]:
+            entry = dict(entry)
+            for key in ("sorts", "aggregates"):
+                entry[key] = [
+                    item["item"] if isinstance(item, dict) and "item" in item else item
+                    for item in entry.get(key) or []
+                ]
+            refs.append(entry)
+        payload["view_refs"] = refs
+        self.conn.execute(
+            'UPDATE "__lsm_op" SET "payload_json" = ? WHERE "id" = ?',
+            (json.dumps(payload, ensure_ascii=False), op),
+        )
+        undo_service.undo(self.conn, op)
+        config = views.load_config(self.conn, view_id)
+        self.assertEqual(config.sorts, [{"column": "金额", "dir": "desc"}])
+        self.assertEqual(config.aggregates, [{"column": "金额", "fn": "sum"}])
+        self.assertNotIn(None, config.sorts)
+        self.assertNotIn(None, config.aggregates)
+
     def test_undo_keeps_zero_width(self):
         self.conn.execute(
             'UPDATE "__lsm_field" SET "width" = 0'
