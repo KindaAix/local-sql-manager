@@ -10,10 +10,12 @@
 - 删列前先把非空值按 (row_id, value) 备份进 __lsm_trash_col；value 用 JSON
   文本存储，bytes 编成 {"b64": ...}，与审计 payload 同一约定。备份完之后才
   删索引、删列、删元数据、清理视图引用。
-- 改类型只动 __lsm_field，不重建物理列；读取侧按逻辑类型 CAST。
+- 改类型只动 __lsm_field，不重建物理列。读取/筛选/排序/汇总按逻辑类型
+  CAST 是层 2（query/rows）的职责，目前尚未实现，所以改类型只影响元数据与
+  之后的界面展示。
 - 四个操作都只写审计、不 commit。删列的撤销处理器返回描述动作的简要
-  payload；字段动作不参与「撤销的撤销」（层 3 的 undo 只认识表级动作，本
-  模块不改 undo.py）。
+  payload；字段动作暂不支持「撤销的撤销」（层 3 的 undo 只认识表级动作，
+  要重做需要 undo 开放 action 分派扩展点，等层 7 统一处理）。
 
 对 schema 内部设施的依赖（同属服务层，包内直接调用；schema 若改这些私有
 名字，本模块需要同步）：
@@ -48,6 +50,8 @@ _SOURCE = "web"
 
 # 视图配置里带 column 键的条目列表，以及纯列名列表。
 _COLUMN_ITEMS = ("filters", "sorts", "aggregates")
+# 顺序有语义的条目列表：撤销时要插回原来的位置，不能简单追加。
+_ORDERED_ITEMS = ("sorts", "aggregates")
 _COLUMN_NAMES = ("hidden", "order")
 
 # 保存点重名时内层 RELEASE 会释放外层，加序号避免复用。
@@ -117,7 +121,7 @@ def _ensure_managed(conn: sqlite3.Connection, table: str) -> str:
     row = conn.execute(
         'SELECT "status" FROM "__lsm_table" WHERE "table_name" = ?', (table,)
     ).fetchone()
-    if row is None or row[0] not in (None, "active"):
+    if row is None or row[0] != "active":
         raise ValueError(f"表未启用编辑：{table}")
     return table
 
@@ -129,8 +133,16 @@ def _check_type(type_: str) -> str:
 
 
 def _check_options(type_: str, options) -> tuple:
-    """校验选项列表：非空文本、且只有单选/多选可带选项。"""
-    cleaned = tuple(options or ())
+    """校验选项列表：必须是列表/元组、元素非空文本，且只有单选/多选可带。
+
+    裸字符串会被 tuple() 拆成单个字符，所以这里先卡类型，不做隐式转换。
+    """
+    if options is None:
+        cleaned = ()
+    elif isinstance(options, (list, tuple)):
+        cleaned = tuple(options)
+    else:
+        raise ValueError("字段选项必须是列表")
     for item in cleaned:
         if not isinstance(item, str) or not item.strip():
             raise ValueError("字段选项必须是非空文本")
@@ -146,10 +158,10 @@ def _options_json(options: tuple) -> str | None:
 def _validate_name(
     conn: sqlite3.Connection, table: str, name: str, *, ignore: str | None = None
 ) -> str:
-    """校验一个新列名：非空、非保留名、不与现有列/物理列撞名。"""
-    name = str(name).strip()
-    if not name:
-        raise ValueError("列名不能为空")
+    """校验一个新列名：非空文本、非保留名、不与现有列/物理列撞名。"""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("列名必须是非空文本")
+    name = name.strip()
     if name.casefold() in {item.casefold() for item in RESERVED_COLUMNS}:
         raise ValueError(f"列名不能使用保留名：{name}")
     for other in _fields(conn, table):
@@ -265,9 +277,13 @@ def _pop_view_refs(config: dict, column: str) -> dict | None:
         if not isinstance(items, list):
             continue
         kept = []
-        for item in items:
+        for index, item in enumerate(items):
             if isinstance(item, dict) and _same(item.get("column"), column):
-                removed[key].append(item)
+                # sorts/aggregates 的顺序有语义，记下原位置供撤销插回。
+                if key in _ORDERED_ITEMS:
+                    removed[key].append({"index": index, "item": item})
+                else:
+                    removed[key].append(item)
             else:
                 kept.append(item)
         if len(kept) != len(items):
@@ -323,7 +339,14 @@ def _restore_view_refs(config: dict, column: str, refs: dict) -> bool:
             for item in current
         ):
             continue
-        config[key] = current + list(items)
+        if key in _ORDERED_ITEMS:
+            # 插回原来的位置，否则删中间一项再撤销会静默改变排序优先级。
+            for entry in sorted(items, key=lambda item: item.get("index") or 0):
+                index = min(int(entry.get("index") or 0), len(current))
+                current.insert(index, entry.get("item"))
+        else:
+            current = current + list(items)
+        config[key] = current
         changed = True
     hidden = refs.get("hidden") or []
     if hidden:
@@ -432,10 +455,33 @@ def _rename_column(
     _rename_view_refs(conn, table, old, new)
 
 
+def _indexes_for_column(
+    conn: sqlite3.Connection, table: str, column: str
+) -> list[str]:
+    """表上所有引用了该列的索引名（含外部表启用编辑时带来的旧索引）。"""
+    found = []
+    for row in conn.execute(f"PRAGMA index_list({_quote(table)})").fetchall():
+        index = row[1]
+        for info in conn.execute(f"PRAGMA index_info({_quote(index)})").fetchall():
+            if _same(info[2], column):
+                found.append(index)
+                break
+    return found
+
+
 def _drop_column(conn: sqlite3.Connection, table: str, column: str) -> None:
     """删索引 → 删物理列 → 删元数据 → 清视图引用；不备份、不写审计。"""
-    conn.execute(f"DROP INDEX IF EXISTS {_quote(schema._index_name(table, column))}")
-    conn.execute(f"ALTER TABLE {_quote(table)} DROP COLUMN {_quote(column)}")
+    for index in _indexes_for_column(conn, table, column):
+        # sqlite_autoindex_* 绑定 UNIQUE/PRIMARY KEY 约束，删不掉，交给下面兜底。
+        if index.startswith("sqlite_"):
+            continue
+        conn.execute(f"DROP INDEX IF EXISTS {_quote(index)}")
+    try:
+        conn.execute(f"ALTER TABLE {_quote(table)} DROP COLUMN {_quote(column)}")
+    except sqlite3.OperationalError as exc:
+        raise ValueError(
+            f"无法删除列「{column}」：该列可能仍被约束或表达式索引引用"
+        ) from exc
     conn.execute(
         'DELETE FROM "__lsm_field" WHERE "table_name" = ? AND "column" = ?',
         (table, column),
@@ -512,13 +558,13 @@ def rename_field(
     field = _find(_fields(conn, table), old)
     if field is None:
         raise ValueError(f"列不存在：{old}")
-    new = str(new).strip()
-    if not new:
-        raise ValueError("列名不能为空")
+    if not isinstance(new, str) or not new.strip():
+        raise ValueError("列名必须是非空文本")
+    new = new.strip()
     if new == field.name:
         raise ValueError("新列名与原列名相同")
     if _same(new, field.name):
-        raise ValueError(f"列已存在：{new}")
+        raise ValueError("SQLite 列名不区分大小写，无法只修改大小写")
     new = _validate_name(conn, table, new, ignore=field.name)
     with _txn(conn):
         _rename_column(conn, table, field.name, new)
@@ -552,7 +598,7 @@ def drop_field(
                 "type": field.type,
                 "options": list(field.options),
                 "position": field.position,
-                "rows": len(backups),
+                "backup_rows": len(backups),
                 # 撤销回填需要列宽与视图引用，随 payload 一起带走。
                 "width": field.width,
                 "view_refs": view_refs,
@@ -652,7 +698,11 @@ def _later_ops_touch_field(
         elif kind in ("create_field", "drop_field", "set_field_type"):
             if _same(payload.get("column"), column):
                 return True
-        for item in payload.get("rows") or []:
+        # 行差分必须是列表；别的 kind 可能用 rows 存计数之类的标量，跳过。
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for item in rows:
             if not isinstance(item, dict):
                 continue
             for side in ("before", "after"):
@@ -673,6 +723,11 @@ def _undo_create_field(conn: sqlite3.Connection, op: dict, source: str) -> dict:
         raise StaleOperation("该字段在此之后已被修改，请先撤销后续操作")
     if _find(_fields(conn, table), column) is None:
         raise StaleOperation(f"列已不存在：{column}")
+    filled = conn.execute(
+        f'SELECT COUNT(*) FROM {_quote(table)} WHERE {_quote(column)} IS NOT NULL'
+    ).fetchone()[0]
+    if filled:
+        raise StaleOperation("该字段已有数据，请先清空再撤销")
     with _txn(conn):
         _drop_column(conn, table, column)
     return {"action": "drop_field", "column": column}
@@ -720,7 +775,9 @@ def _undo_drop_field(conn: sqlite3.Connection, op: dict, source: str) -> dict:
         (op["id"], column),
     ).fetchall()
     position = payload.get("position")
-    width = payload.get("width") or schema.DEFAULT_FIELD_WIDTH
+    width = payload.get("width")
+    if width is None:
+        width = schema.DEFAULT_FIELD_WIDTH
     with _txn(conn):
         if isinstance(position, int):
             conn.execute(

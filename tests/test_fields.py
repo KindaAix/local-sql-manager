@@ -12,7 +12,7 @@ from local_sql_manager.services import fields, undo as undo_service, views
 from local_sql_manager.services.audit import get_op
 from local_sql_manager.services.library import ensure_meta
 from local_sql_manager.services.models import StaleOperation, ViewConfig
-from local_sql_manager.services.rows import update_cells
+from local_sql_manager.services.rows import insert_rows, update_cells
 from local_sql_manager.services.schema import ColumnSpec, create_table, drop_table, get_fields
 from local_sql_manager.services.util import utcnow_iso
 
@@ -131,6 +131,14 @@ class TestAddField(BaseFieldCase):
         with self.assertRaises(ValueError):
             fields.add_field(self.conn, "订单", ColumnSpec("   ", "text"))
 
+    def test_rejects_non_string_name(self):
+        with self.assertRaises(ValueError):
+            fields.add_field(self.conn, "订单", ColumnSpec(None, "text"))
+
+    def test_rejects_non_string_rename_target(self):
+        with self.assertRaises(ValueError):
+            fields.rename_field(self.conn, "订单", "金额", None)
+
     def test_rejects_unknown_type(self):
         with self.assertRaises(ValueError):
             fields.add_field(self.conn, "订单", ColumnSpec("x", "currency"))
@@ -143,11 +151,24 @@ class TestAddField(BaseFieldCase):
         with self.assertRaises(ValueError):
             fields.add_field(self.conn, "订单", ColumnSpec("x", "select", (1, 2)))
 
+    def test_rejects_bare_string_options(self):
+        with self.assertRaises(ValueError):
+            fields.add_field(self.conn, "订单", ColumnSpec("标签", "select", "abc"))
+        with self.assertRaises(ValueError):
+            fields.set_field_type(self.conn, "订单", "状态", "select", "abc")
+
     def test_rejects_unmanaged_table(self):
         self.conn.execute('CREATE TABLE "外部" ("a" TEXT)')
         with self.assertRaises(ValueError):
             fields.add_field(self.conn, "外部", ColumnSpec("b", "text"))
         self.assertNotIn("b", self.columns("外部"))
+
+    def test_rejects_table_without_active_status(self):
+        self.conn.execute(
+            'UPDATE "__lsm_table" SET "status" = NULL WHERE "table_name" = ?', ("订单",)
+        )
+        with self.assertRaises(ValueError):
+            fields.add_field(self.conn, "订单", ColumnSpec("折扣", "number"))
 
     def test_creates_index(self):
         fields.add_field(self.conn, "订单", ColumnSpec("折扣", "number"))
@@ -248,8 +269,9 @@ class TestRenameField(BaseFieldCase):
 
     def test_rejects_existing_name_case_insensitive(self):
         create_table(self.conn, "abc", [ColumnSpec("Area", "text")])
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             fields.rename_field(self.conn, "abc", "Area", "area")
+        self.assertIn("不区分大小写", str(ctx.exception))
 
     def test_rejects_reserved_name(self):
         with self.assertRaises(ValueError):
@@ -352,7 +374,30 @@ class TestDropField(BaseFieldCase):
         self.assertEqual(payload["type"], "number")
         self.assertEqual(payload["options"], [])
         self.assertEqual(payload["position"], 1)
-        self.assertEqual(payload["rows"], 2)
+        self.assertEqual(payload["backup_rows"], 2)
+
+    def test_drops_extra_indexes_on_the_column(self):
+        self.conn.execute('CREATE INDEX "我的索引" ON "订单" ("金额")')
+        fields.drop_field(self.conn, "订单", "金额")
+        self.assertNotIn("我的索引", self.indexes())
+        self.assertNotIn("金额", self.columns())
+
+    def test_expression_index_fails_with_chinese_message(self):
+        quote = "'"
+        self.conn.execute(
+            f'CREATE INDEX "表达式索引" ON "订单" ("金额" || {quote}{quote})'
+        )
+        with self.assertRaises(ValueError) as ctx:
+            fields.drop_field(self.conn, "订单", "金额")
+        self.assertIn("无法删除列", str(ctx.exception))
+        self.assertIn("金额", self.columns())
+
+    def test_earlier_row_undo_still_works(self):
+        # 回归：payload 里曾用 "rows": <int>，undo 会把它当行差分遍历后崩溃。
+        insert_op = insert_rows(self.conn, "订单", [{"备注": "后加"}])
+        fields.drop_field(self.conn, "订单", "金额")
+        undo_service.undo(self.conn, insert_op)
+        self.assertEqual(self.count('SELECT COUNT(*) FROM "订单"'), 2)
 
     def test_rejects_unknown_column(self):
         with self.assertRaises(ValueError):
@@ -480,6 +525,13 @@ class TestUndoCreateField(BaseFieldCase):
             undo_service.undo(self.conn, op)
         self.assertIn("折扣", self.columns())
 
+    def test_stale_when_column_holds_data_without_audit(self):
+        op = fields.add_field(self.conn, "订单", ColumnSpec("折扣", "number"))
+        self.conn.execute('UPDATE "订单" SET "折扣" = 5 WHERE "id" = ?', (self.first,))
+        with self.assertRaises(StaleOperation):
+            undo_service.undo(self.conn, op)
+        self.assertIn("折扣", self.columns())
+
     def test_stale_when_renamed_after(self):
         op = fields.add_field(self.conn, "订单", ColumnSpec("折扣", "number"))
         fields.rename_field(self.conn, "订单", "折扣", "折扣率")
@@ -570,6 +622,46 @@ class TestUndoDropField(BaseFieldCase):
         self.assertEqual(
             self.count('SELECT COUNT(*) FROM "__lsm_trash_col" WHERE "op_id" = ?', (op,)), 0
         )
+
+    def test_restores_sort_and_aggregate_order(self):
+        view_id = self.add_view(
+            ViewConfig(
+                sorts=[
+                    {"column": "备注", "dir": "asc"},
+                    {"column": "金额", "dir": "desc"},
+                    {"column": "状态", "dir": "asc"},
+                ],
+                aggregates=[
+                    {"column": "备注", "fn": "count"},
+                    {"column": "金额", "fn": "sum"},
+                    {"column": "状态", "fn": "count"},
+                ],
+            )
+        )
+        op = fields.drop_field(self.conn, "订单", "金额")
+        undo_service.undo(self.conn, op)
+        config = views.load_config(self.conn, view_id)
+        self.assertEqual(
+            [item["column"] for item in config.sorts], ["备注", "金额", "状态"]
+        )
+        self.assertEqual(
+            [item["column"] for item in config.aggregates], ["备注", "金额", "状态"]
+        )
+
+    def test_undo_keeps_zero_width(self):
+        self.conn.execute(
+            'UPDATE "__lsm_field" SET "width" = 0'
+            ' WHERE "table_name" = ? AND "column" = ?',
+            ("订单", "金额"),
+        )
+        op = fields.drop_field(self.conn, "订单", "金额")
+        undo_service.undo(self.conn, op)
+        width = self.conn.execute(
+            'SELECT "width" FROM "__lsm_field"'
+            ' WHERE "table_name" = ? AND "column" = ?',
+            ("订单", "金额"),
+        ).fetchone()[0]
+        self.assertEqual(width, 0)
 
     def test_undo_twice_is_rejected(self):
         op = fields.drop_field(self.conn, "订单", "金额")

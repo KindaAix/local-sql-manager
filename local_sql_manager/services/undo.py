@@ -400,7 +400,8 @@ def _invert_action(conn: sqlite3.Connection, action: dict, base_op: int | None) 
         return trash_table(conn, action["table"], base_op=base_op)
     if kind == "rename_table":
         return _rename_action(conn, action["new"], action["old"])
-    raise StaleOperation(f"无法撤销的表级动作：{kind}")
+    # 第三方 kind 的撤销记录目前没有反向分派（例如字段动作），文案保持中性。
+    raise StaleOperation("该操作不支持再次撤销")
 
 
 def _undo_irreversible(conn: sqlite3.Connection, op: dict, source: str) -> dict:
