@@ -92,3 +92,76 @@ def make_csv_bom_dup(path):
         writer.writerow(["金额", "金额", "名称"])
         writer.writerow(["10", "20", "测试"])
     return path
+
+def make_header_only_workbook(path):
+    """只有表头、没有数据行的 sheet。"""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "只有表头"
+    sheet.append(["名称", "金额"])
+    workbook.save(path)
+    return path
+
+
+def make_id_header_workbook(path):
+    """表头撞上受管表的内部列名 id。"""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "编号表"
+    sheet.append(["id", "名称"])
+    sheet.append(["7", "甲"])
+    workbook.save(path)
+    return path
+
+
+def make_collision_workbook(path):
+    """两个 sheet 清洗后同名（「订单」与尾随空格的「订单 」）。"""
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "订单"
+    first.append(["值"])
+    first.append(["a"])
+    second = workbook.create_sheet("订单 ")
+    second.append(["值"])
+    second.append(["b"])
+    workbook.save(path)
+    return path
+
+
+def make_dirty_workbook(path):
+    """第 2 个数据行的金额是 N/A，强制 number 时会失败。"""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "脏值"
+    sheet.append(["名称", "金额"])
+    sheet.append(["甲", "1"])
+    sheet.append(["乙", "N/A"])
+    workbook.save(path)
+    return path
+
+
+def make_csv_gbk(path):
+    """中文 Windows 上 Excel 另存的 ANSI/GBK 编码 CSV。"""
+    with open(path, "w", encoding="gbk", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["名称", "金额"])
+        writer.writerow(["张三", "10"])
+    return path
+
+
+def make_csv_nul(path):
+    """数据行里含 NUL 字节，csv 模块会拒绝。"""
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write("名称,金额\n")
+        handle.write("甲,1\n")
+        handle.write("乙,\x00\n")
+    return path
+
+
+def make_csv_long_header(path):
+    """表头超过 64 字符的 CSV。"""
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["c" * 65, "值"])
+        writer.writerow(["x", "1"])
+    return path

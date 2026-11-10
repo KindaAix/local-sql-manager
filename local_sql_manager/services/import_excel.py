@@ -38,6 +38,14 @@ SAMPLE_ROWS = 5
 # 类型推断的取样行数：超出的行照常导入，只是不参与推断。
 INFER_SAMPLE_ROWS = 5000
 
+# 表名与列名的长度上限，避免超长 sheet 名/表头生成难以使用的标识符。
+MAX_NAME_LENGTH = 64
+
+# 受管表自带或 SQLite 内建的列名，业务列必须避开（大小写不敏感）。
+_RESERVED_COLUMNS = frozenset(
+    {"id", "created_at", "updated_at", "deleted_at", "rowid"}
+)
+
 # 导入与预览都来自界面，MCP 若需区分可后续加 source 参数。
 _SOURCE = "web"
 
@@ -45,6 +53,11 @@ _SOURCE = "web"
 _FORBIDDEN_CHARS = set('[]:*?/\\')
 
 _RESERVED_PREFIXES = ("__lsm_", "sqlite_")
+
+# 中文 Windows 上 Excel 另存的 CSV 常见 ANSI/GBK，按此顺序尝试解码。
+_CSV_ENCODINGS = ("utf-8-sig", "gb18030")
+
+_CSV_ENCODING_ERROR = "无法读取文件：请另存为 UTF-8 或 GBK 编码的 CSV"
 
 
 @dataclass
@@ -99,24 +112,31 @@ def _is_blank_row(values: Sequence[object]) -> bool:
     return all(not _cell_text(value) for value in values)
 
 
+def _unique_name(base: str, used: set[str]) -> str:
+    """在 used（小写）里取一个不重复的名字，整体不超过 MAX_NAME_LENGTH。"""
+    name = base
+    suffix = 2
+    while name.lower() in used:
+        tail = f"_{suffix}"
+        name = base[: MAX_NAME_LENGTH - len(tail)] + tail
+        suffix += 1
+    used.add(name.lower())
+    return name
+
+
 def _header_names(raw: Sequence[object]) -> list[str]:
-    """首行转列名：去尾部空列、空列名补 ColumnN、重名加 _2 后缀。"""
+    """首行转列名：去尾部空列、空列名补 ColumnN、重名与内部列名消歧。"""
     texts = [_cell_text(value) for value in raw]
     while texts and not texts[-1]:
         texts.pop()
 
+    # 受管表会无条件加 id/created_at/updated_at/deleted_at，表头撞上这些
+    # 名字时必须先改名，否则 CREATE TABLE 会因重复列名失败。
+    used: set[str] = set(_RESERVED_COLUMNS)
     names: list[str] = []
-    # SQLite 的列名大小写不敏感，"Name" 与 "name" 也算重名。
-    used: set[str] = set()
     for index, text in enumerate(texts, start=1):
-        base = text or f"Column{index}"
-        name = base
-        suffix = 2
-        while name.lower() in used:
-            name = f"{base}_{suffix}"
-            suffix += 1
-        used.add(name.lower())
-        names.append(name)
+        base = (text or f"Column{index}")[:MAX_NAME_LENGTH]
+        names.append(_unique_name(base, used))
     return names
 
 
@@ -156,39 +176,65 @@ def _is_csv(path) -> bool:
     return str(path).lower().endswith(".csv")
 
 
-def _read_csv_header(path) -> list[str]:
-    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
-        for raw in csv.reader(handle):
-            if _is_blank_row(raw):
-                continue
-            return _header_names(raw)
+def _csv_encoding(path) -> str:
+    """优先 utf-8-sig，失败回退 gb18030；都失败时给中文提示。"""
+    error: UnicodeDecodeError | None = None
+    for encoding in _CSV_ENCODINGS:
+        try:
+            with open(path, "r", encoding=encoding, newline="") as handle:
+                for _line in handle:
+                    pass
+            return encoding
+        except UnicodeDecodeError as exc:
+            error = exc
+        except OSError as exc:
+            raise ValueError(f"无法读取文件：{exc}") from exc
+    raise ValueError(_CSV_ENCODING_ERROR) from error
+
+
+def _csv_lines(path, encoding: str) -> Iterator[list[str]]:
+    """逐行读 CSV；csv 模块的底层错误统一转成中文 ValueError。"""
+    try:
+        handle = open(path, "r", encoding=encoding, newline="")
+    except OSError as exc:
+        raise ValueError(f"无法读取文件：{exc}") from exc
+    with handle:
+        try:
+            for raw in csv.reader(handle):
+                # Python 3.11+ 的 csv 不再对 NUL 报错，这里主动拒绝，
+                # 避免不可见控制字符一路写进 SQLite。
+                if any("\x00" in cell for cell in raw):
+                    raise ValueError("无法读取文件：CSV 内容不合法（含 NUL 字符）")
+                yield raw
+        except csv.Error as exc:
+            raise ValueError(f"无法读取文件：CSV 内容不合法（{exc}）") from exc
+
+
+def _read_csv_header(path, encoding: str) -> list[str]:
+    for raw in _csv_lines(path, encoding):
+        if _is_blank_row(raw):
+            continue
+        return _header_names(raw)
     return []
 
 
 def _csv_sheet(path) -> _Sheet:
-    """CSV 只有一个 sheet，名字取文件 stem；utf-8-sig 兼容带 BOM 的文件。"""
-    try:
-        columns = _read_csv_header(path)
-    except OSError as exc:
-        raise ValueError(f"无法读取文件：{exc}") from exc
+    """CSV 只有一个 sheet，名字取文件 stem；utf-8-sig / gb18030 兼容两种常见编码。"""
+    encoding = _csv_encoding(path)
+    columns = _read_csv_header(path, encoding)
 
     def rows() -> Iterator[list[str]]:
         if not columns:
             return
         width = len(columns)
-        try:
-            handle = open(path, "r", encoding="utf-8-sig", newline="")
-        except OSError as exc:
-            raise ValueError(f"无法读取文件：{exc}") from exc
-        with handle:
-            header_seen = False
-            for raw in csv.reader(handle):
-                if _is_blank_row(raw):
-                    continue
-                if not header_seen:
-                    header_seen = True
-                    continue
-                yield _row_values(raw, width)
+        header_seen = False
+        for raw in _csv_lines(path, encoding):
+            if _is_blank_row(raw):
+                continue
+            if not header_seen:
+                header_seen = True
+                continue
+            yield _row_values(raw, width)
 
     return _Sheet(Path(path).stem, columns, rows)
 
@@ -233,7 +279,8 @@ def _preview(sheet: _Sheet) -> SheetPreview:
         sample=sample,
         types=types,
         suspicious=suspicious,
-        empty=False,
+        # 只有表头没有数据也按空表处理，界面才会灰掉、不会建 0 行表。
+        empty=row_count == 0,
         sampled=row_count > INFER_SAMPLE_ROWS,
     )
 
@@ -245,22 +292,24 @@ def parse_workbook(path) -> list[SheetPreview]:
 
     workbook = _open_workbook(path)
     try:
-        return [_preview(_worksheet_sheet(worksheet)) for worksheet in workbook.worksheets]
+        return [
+            _preview(_worksheet_sheet(worksheet)) for worksheet in workbook.worksheets
+        ]
     finally:
         workbook.close()
 
 
 def _sanitize_table_name(name: object) -> str:
-    """把 sheet 名清成可用的表名：替换非法字符、避开内部命名空间。"""
+    """把 sheet 名清成可用的表名：替换非法字符、避开内部命名空间、截断。"""
     text = "".join(
         "_" if char in _FORBIDDEN_CHARS or ord(char) < 32 else char
         for char in str(name)
     ).strip()
     if not text:
-        return "Sheet1"
+        text = "Sheet1"
     if text.lower().startswith(_RESERVED_PREFIXES):
-        return "_" + text
-    return text
+        text = "_" + text
+    return text[:MAX_NAME_LENGTH]
 
 
 def _find_object(conn: sqlite3.Connection, name: str) -> tuple[str, str] | None:
@@ -275,7 +324,8 @@ def _find_object(conn: sqlite3.Connection, name: str) -> tuple[str, str] | None:
 def _copy_name(conn: sqlite3.Connection, base: str) -> str:
     suffix = 2
     while True:
-        candidate = f"{base}_{suffix}"
+        tail = f"_{suffix}"
+        candidate = base[: MAX_NAME_LENGTH - len(tail)] + tail
         if _find_object(conn, candidate) is None:
             return candidate
         suffix += 1
@@ -342,11 +392,16 @@ def _resolve_types(sheet: _Sheet, overrides: dict) -> dict[str, str]:
 def _insert_rows(
     conn: sqlite3.Connection,
     table: str,
+    sheet_name: str,
     columns: list[str],
     column_types: dict[str, str],
     rows: Iterator[list[str]],
 ) -> int:
-    """分批写入数据行，返回写入了多少行。"""
+    """分批写入数据行，返回写入了多少行。
+
+    报错行号按「非空数据行」计数，表头算第 1 行；用于把脏值定位到
+    sheet / 行 / 列，而不是抛出 sqlite/py 的英文原文。
+    """
     now = utcnow_iso()
     names = ["created_at", "updated_at"] + columns
     sql = (
@@ -357,11 +412,17 @@ def _insert_rows(
 
     batch: list[list[object]] = []
     row_count = 0
-    for row in rows:
-        values = [
-            coerce(text, column_types[column])
-            for text, column in zip(row, columns)
-        ]
+    for row_no, row in enumerate(rows, start=2):
+        values = []
+        for text, column in zip(row, columns):
+            type_ = column_types[column]
+            try:
+                values.append(coerce(text, type_))
+            except ValueError as exc:
+                raise ValueError(
+                    f"工作表 {sheet_name} 第 {row_no} 行「{column}」"
+                    f"无法转换为 {type_}：{text!r}"
+                ) from exc
         batch.append([now, now] + values)
         row_count += 1
         if len(batch) >= BATCH_SIZE:
@@ -411,7 +472,7 @@ def import_sheets(
     """
     if on_conflict not in ("overwrite", "copy", "skip"):
         raise ValueError(f"未知的同名处理方式：{on_conflict}")
-    selected = [str(name) for name in selected or []]
+    selected = list(dict.fromkeys(str(name) for name in selected or []))
     if not selected:
         return []
 
@@ -419,21 +480,31 @@ def import_sheets(
     if not isinstance(overrides, dict):
         raise ValueError("类型覆盖必须是 {sheet: {column: type}} 形式")
 
+    # 同一次导入里两张 sheet 清洗/截断后可能同名，必须提前拒绝：否则 skip
+    # 会静默少导一张，overwrite 会把本次刚建的表当成旧表移进回收站。
+    planned: dict[str, str] = {}
+    for sheet_name in selected:
+        table_name = _sanitize_table_name(sheet_name)
+        key = table_name.lower()
+        if key in planned:
+            raise ValueError(f"多个工作表清洗后同名：{table_name}")
+        planned[key] = sheet_name
+
     created: list[str] = []
     details: list[dict] = []
     filename = os.path.basename(str(path))
 
     workbook = None
-    if _is_csv(path):
-        sheets = {sheet.name: sheet for sheet in [_csv_sheet(path)]}
-    else:
-        workbook = _open_workbook(path)
-        sheets = {
-            worksheet.title: _worksheet_sheet(worksheet)
-            for worksheet in workbook.worksheets
-        }
-
     try:
+        if _is_csv(path):
+            sheets = {sheet.name: sheet for sheet in [_csv_sheet(path)]}
+        else:
+            workbook = _open_workbook(path)
+            sheets = {
+                worksheet.title: _worksheet_sheet(worksheet)
+                for worksheet in workbook.worksheets
+            }
+
         with _import_txn(conn):
             for sheet_name in selected:
                 sheet = sheets.get(sheet_name)
@@ -448,11 +519,19 @@ def import_sheets(
                 create_table(
                     conn,
                     table,
-                    [ColumnSpec(column, column_types[column]) for column in sheet.columns],
+                    [
+                        ColumnSpec(column, column_types[column])
+                        for column in sheet.columns
+                    ],
                     source_file=filename,
                 )
                 row_count = _insert_rows(
-                    conn, table, list(sheet.columns), column_types, sheet.rows()
+                    conn,
+                    table,
+                    sheet_name,
+                    list(sheet.columns),
+                    column_types,
+                    sheet.rows(),
                 )
                 created.append(table)
                 details.append(

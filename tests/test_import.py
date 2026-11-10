@@ -21,9 +21,16 @@ from local_sql_manager.services.schema import (
 )
 from tests.fixtures.make_fixtures import (
     make_bad_workbook,
+    make_collision_workbook,
     make_csv,
     make_csv_bom_dup,
+    make_csv_gbk,
+    make_csv_long_header,
+    make_csv_nul,
+    make_dirty_workbook,
     make_dup_workbook,
+    make_header_only_workbook,
+    make_id_header_workbook,
     make_large_workbook,
     make_reserved_workbook,
     make_workbook,
@@ -74,6 +81,14 @@ class TestParseWorkbook(ImportTestCase):
         preview = parse_workbook(path)[0]
         self.assertEqual(preview.row_count, 5200)
         self.assertTrue(preview.sampled)
+
+    def test_header_only_sheet_preview_is_empty(self):
+        preview = parse_workbook(
+            self.make("只有表头.xlsx", make_header_only_workbook)
+        )[0]
+        self.assertEqual(preview.columns, ["名称", "金额"])
+        self.assertEqual(preview.row_count, 0)
+        self.assertTrue(preview.empty)
 
     def test_empty_preview_has_no_columns(self):
         preview = parse_workbook(self.make("订单.xlsx", make_workbook))[1]
@@ -171,7 +186,7 @@ class TestImportSheets(ImportTestCase):
         )
 
     def test_failure_rolls_back_everything(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             import_sheets(
                 self.conn,
                 self.make("坏.xlsx", make_bad_workbook),
@@ -274,6 +289,73 @@ class TestImportSheets(ImportTestCase):
             "名称5200",
         )
 
+    def test_sheet_with_internal_column_header_imports(self):
+        created = import_sheets(
+            self.conn,
+            self.make("编号表.xlsx", make_id_header_workbook),
+            ["编号表"],
+            {},
+            "skip",
+        )
+        self.assertEqual(created, ["编号表"])
+        self.assertEqual(
+            [field.name for field in get_fields(self.conn, "编号表")],
+            ["id_2", "名称"],
+        )
+        self.assertEqual(self.rows("编号表")[0]["id_2"], 7)
+
+    def test_colliding_sanitized_sheet_names_are_rejected(self):
+        path = self.make("撞名.xlsx", make_collision_workbook)
+        for mode in ("skip", "overwrite"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    ValueError, "多个工作表清洗后同名：订单"
+                ):
+                    import_sheets(self.conn, path, ["订单", "订单 "], {}, mode)
+                self.assertEqual(list_tables(self.conn), [])
+                self.assertEqual(audit.history(self.conn), [])
+
+    def test_duplicate_selection_is_deduplicated(self):
+        created = import_sheets(
+            self.conn,
+            self.make("订单.xlsx", make_workbook),
+            ["订单", "订单"],
+            {},
+            "overwrite",
+        )
+        self.assertEqual(created, ["订单"])
+
+    def test_dirty_value_reports_sheet_row_and_column(self):
+        with self.assertRaisesRegex(ValueError, "工作表 脏值 第 3 行「金额」"):
+            import_sheets(
+                self.conn,
+                self.make("脏值.xlsx", make_dirty_workbook),
+                ["脏值"],
+                {"脏值": {"金额": "number"}},
+                "skip",
+            )
+        self.assertEqual(list_tables(self.conn), [])
+        self.assertEqual(audit.history(self.conn), [])
+
+    def test_import_does_not_commit(self):
+        db_path = os.path.join(self.tmp.name, "库.sqlite")
+        conn = sqlite3.connect(db_path)
+        self.addCleanup(conn.close)
+        ensure_meta(conn)
+        import_sheets(
+            conn, self.make("订单.xlsx", make_workbook), ["订单"], {}, "skip"
+        )
+        self.assertTrue(conn.in_transaction)
+        other = sqlite3.connect(db_path, timeout=5)
+        self.addCleanup(other.close)
+        names = [
+            row[0]
+            for row in other.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        ]
+        self.assertNotIn("订单", names)
+
     def test_invalid_conflict_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             import_sheets(
@@ -336,6 +418,15 @@ class TestHeaderNames(unittest.TestCase):
     def test_trailing_blank_columns_are_dropped(self):
         self.assertEqual(_header_names(["名称", None, None]), ["名称"])
 
+    def test_internal_columns_are_avoided(self):
+        self.assertEqual(_header_names(["id", "名称"]), ["id_2", "名称"])
+
+    def test_internal_columns_ignore_case(self):
+        self.assertEqual(_header_names(["ID", "Id"]), ["ID_2", "Id_3"])
+
+    def test_long_header_is_truncated(self):
+        self.assertEqual(_header_names(["c" * 65]), ["c" * 64])
+
 
 class TestSanitize(unittest.TestCase):
     def test_replaces_forbidden_characters(self):
@@ -343,6 +434,9 @@ class TestSanitize(unittest.TestCase):
 
     def test_falls_back_for_blank_name(self):
         self.assertEqual(_sanitize_table_name("   "), "Sheet1")
+
+    def test_long_table_name_is_truncated(self):
+        self.assertEqual(_sanitize_table_name("t" * 65), "t" * 64)
 
     def test_reserved_prefix_is_escaped(self):
         name = _sanitize_table_name("__lsm_x")
@@ -369,6 +463,35 @@ class TestCsv(ImportTestCase):
         self.assertEqual(row["编码"], "007")
         self.assertEqual(row["金额"], 12.5)
         self.assertEqual(list_tables(self.conn), ["客户"])
+
+    def test_gbk_csv_import(self):
+        created = import_sheets(
+            self.conn, self.make("客户.csv", make_csv_gbk), ["客户"], {}, "skip"
+        )
+        self.assertEqual(created, ["客户"])
+        self.assertEqual(self.rows("客户")[0]["名称"], "张三")
+
+    def test_csv_with_nul_is_reported_in_chinese(self):
+        with self.assertRaisesRegex(ValueError, "CSV 内容不合法"):
+            import_sheets(
+                self.conn, self.make("坏.csv", make_csv_nul), ["坏"], {}, "skip"
+            )
+
+    def test_oversized_csv_field_is_reported_in_chinese(self):
+        path = os.path.join(self.tmp.name, "大字段.csv")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("名称,金额\n")
+            handle.write("甲," + "x" * 131073 + "\n")
+        with self.assertRaisesRegex(ValueError, "CSV 内容不合法"):
+            import_sheets(self.conn, path, ["大字段"], {}, "skip")
+
+    def test_long_csv_names_are_truncated(self):
+        stem = "t" * 65
+        path = os.path.join(self.tmp.name, stem + ".csv")
+        make_csv_long_header(path)
+        created = import_sheets(self.conn, path, [stem], {}, "skip")
+        self.assertEqual(created, ["t" * 64])
+        self.assertEqual(len(get_fields(self.conn, created[0])[0].name), 64)
 
     def test_csv_with_bom_and_duplicate_columns(self):
         path = self.make("重复.csv", make_csv_bom_dup)
