@@ -231,7 +231,11 @@ def _later_ops_touch_row(
             payload = json.loads(raw) if raw else {}
         except (TypeError, ValueError):
             continue
-        for item in payload.get("rows") or []:
+        payload_rows = payload.get("rows")
+        if not isinstance(payload_rows, list):
+            # 非行级操作（如 merge 的 payload）没有行差分，跳过。
+            continue
+        for item in payload_rows:
             if not isinstance(item, dict):
                 continue
             row_id = _as_id(item.get("id"))
@@ -356,6 +360,15 @@ def _has_later_ops(conn: sqlite3.Connection, table: str, op_id: int) -> bool:
         (op_id, table, *exempt),
     ).fetchone()
     return row is not None
+
+
+def has_later_ops(conn: sqlite3.Connection, table: str, op_id: int) -> bool:
+    """该表在 op 之后是否还有未撤销的数据写入。
+
+    供合并、导入等外部撤销处理器复用同一口径：豁免的 kind 随已注册的处理器
+    动态计算，外部模块不要自己硬编码。
+    """
+    return _has_later_ops(conn, table, op_id)
 
 
 def _op_table_name(op: dict) -> str:
