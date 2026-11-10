@@ -300,7 +300,7 @@ def test_registers_field_metadata(conn):
 def test_creates_index_per_business_column(conn):
     create_table(conn, "订单", [ColumnSpec("金额", "number")])
     idx = [r[0] for r in conn.execute('PRAGMA index_list("订单")')]
-    self.assertIn("__lsm_idx_订单_金额", idx)
+    self.assertIn("__lsm_idx_2_订单_2_金额", idx)
 
 ```
 
