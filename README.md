@@ -1,210 +1,128 @@
-![](http://media.charlesleifer.com/blog/photos/sqlite-web.png)
+# 本地多维表格管理器
 
-`sqlite-web` is a web-based SQLite database browser written in Python.
+把 Excel 里的那张表，变成一个能筛选、能分组、能撤销、还能让 AI 直接读写的本地数据库。
 
-Project dependencies:
+## 这是什么
 
-* [flask](http://flask.pocoo.org)
-* [peewee](http://docs.peewee-orm.com)
-* [pygments](http://pygments.org)
+本地多维表格管理器是一个跑在自己电脑上的桌面小工具：双击启动后它会拉起一个只监听
+`127.0.0.1` 的本地服务，用浏览器打开界面，同时在系统托盘常驻。
 
-### Installation
+- 数据全部存在本地的一个 SQLite 文件里，没有账号、没有云同步、不发任何网络请求。
+- 这个库文件就是标准的 `.sqlite`，用任何 SQLite 工具都能打开，随时可以备份或拷走。
+- 除了给人用的网页界面，它还会在同一台机器上开一个 MCP 服务，让支持 MCP 的 AI
+  agent 用同一套接口读写同一批数据。
+- 界面文案、类型推断、导入导出都按中文场景处理（UTF-8 / GBK 的 CSV、Excel 多工作表等）。
 
-```sh
-$ pip install sqlite-web
-```
+## 安装与启动
 
-### Usage
+### 从源码运行
 
-```sh
-$ sqlite_web /path/to/database.db
-```
-
-If you have multiple databases:
+需要 Python 3.10 及以上。
 
 ```sh
-$ sqlite_web /path/to/db1.db /path/to/db2.db /path/to/db3.db
+uv venv
+uv pip install -e .
+.venv/Scripts/python.exe -m local_sql_manager.desktop.launcher
 ```
 
-Or run with docker:
+启动后会自动打开浏览器；之后从系统托盘的图标菜单里可以打开界面、打开数据目录、查看
+日志或退出。重复启动不会开出第二个进程——它检测到已在运行时会提示你去托盘里找。
 
-```sh
-$ docker run -it --rm \
-    -p 8080:8080 \
-    -v /path/to/your-data:/data \
-    ghcr.io/coleifer/sqlite-web:latest \
-    db_filename.db
+如果你把 `pystray` 卸掉了，程序会退化成前台运行，按 Ctrl+C 退出。
+
+### 使用打包版
+
+安装包安装完成后，双击开始菜单或桌面上的「本地多维表格管理器」即可，不需要装 Python。
+
+## 数据放在哪里
+
+| 内容 | 位置 |
+| --- | --- |
+| 库文件（你的数据） | `文档/LocalSQLManager`，默认库名 `我的数据.sqlite` |
+| 配置 `config.json` | `%LOCALAPPDATA%\\LocalSQLManager` |
+| 日志 `logs/app-YYYY-MM-DD.log` | `%LOCALAPPDATA%\\LocalSQLManager` |
+
+设置环境变量 `LSM_DATA_DIR` 可以把「配置与日志」整体挪到别的目录（便携使用或在测试
+里隔离环境时很有用）。
+
+因为库就是一个普通文件，备份它的正确做法就是复制这个 `.sqlite` 文件（建议先退出程序）。
+想换机器、想给同事一份，把文件拷到对方的库目录里就能直接打开。
+
+页面默认端口 `8765`，MCP 默认端口 `8766`；端口被占用时会自动换一个空闲端口，实际
+端口可以在界面地址栏和日志里看到。
+
+## 功能一览
+
+**导入**：拖入 Excel（`.xlsx`）或 CSV（`.csv`），多工作表可逐个勾选导入；导入前会给
+出每张表的列名、行数、类型推断结果和可疑内容的预览，确认后才落库。CSV 先按 UTF-8（含
+BOM）解码，失败再回退 GB18030/GBK。
+
+**网格**：每张表是一张网格，支持筛选、排序、按列分组并在组上做汇总（计数/求和/平均等）、
+隐藏列、调整列顺序与列宽、切换分页。视图（一套筛选 + 排序 + 分组 + 列设置的组合）可以
+保存、改名、设默认。
+
+**编辑**：直接改单元格、批量插入与删除。删除是软删，行进回收站还能恢复；读取默认看不到
+已删除的行。两次读取之间有人改过同一行时，保存会提示冲突并给出最新值，不会静默覆盖。
+
+**撤销与回收站**：每个操作都在库里留一条审计记录，可以逐条撤销；撤销本身也是一条操作。
+表被删除会进回收站，可恢复、可彻底删除（彻底删除不可撤销）。
+
+**字段**：新建列、改名、改类型（按新类型重新解释已有值）、删除列（值会先备份，撤销时回填）。
+
+**导出**：把当前视图或整张表导出为 Excel 或 CSV。
+
+**分享包**：把整个库导出成 `.lsmf` 文件（本质是一个只含 `manifest.json` 和 `db.sqlite`
+的 zip），审计记录和回收站一起带走；导入时作为新库打开，重名自动加后缀。
+
+**外部表**：直接用别的工具建在同一个库里的表，可以在界面上启用编辑（补上系统列与索引、
+纳入审计），之后按受管表使用。
+
+**多表合并**：把几张结构相近的表按列映射合并成一张新表，合并操作同样可以撤销。
+
+## 让 AI 读写你的库（MCP）
+
+程序起来后 MCP 服务就在 `http://127.0.0.1:8766/mcp` 上（端口取 `config.json` 的
+`mcp_port`）。托盘菜单里的「复制 MCP 配置」会把这段 JSON 直接放进剪贴板：
+
+```json
+{
+  "mcpServers": {
+    "local-sql-manager": {
+      "type": "http",
+      "url": "http://127.0.0.1:8766/mcp"
+    }
+  }
+}
 ```
 
-Or run with the high-performance gevent WSGI server (requires `gevent`):
+把它粘到你的 MCP 客户端配置里，重启客户端即可。agent 看到的是和界面完全一样的数据：
+同一个库、同一套表、同一份视图。
 
-```console
-$ sqlite_wsgi /path/to/db.db
+**只读开关**：在 `config.json` 里把 `mcp_read_only` 改成 `true`（默认 `false`），重启后
+agent 就只剩查询能力，任何写入都会被拒绝。想让 agent 随便看但只能由人来改，就打开它。
+
+写操作同样带并发保护：agent 修改前必须提供它读到的版本信息，中途被你改过的行会让它拿到
+冲突错误，而不是覆盖你的编辑。
+
+## 打包 Windows 安装包
+
+打包脚本把程序编译成不依赖系统 Python 的目录版程序，再交给 Inno Setup 做成安装包：
+
+```powershell
+powershell -File packaging/build.ps1
 ```
 
-Then navigate to http://localhost:8080/ to view your database.
+需要预装 [Nuitka](https://nuitka.net/)（含兼容的 C 编译器）与
+[Inno Setup 6](https://jrsoftware.org/isinfo.php)。产物在 `build/` 目录下。
 
-### Features
+## 已知限制
 
-* Works with your existing SQLite databases, or can be used to create new databases.
-* Add or drop:
-  * Tables
-  * Columns (with support for older versions of Sqlite)
-  * Indexes
-* Export data as JSON or CSV.
-* Import JSON or CSV files.
-* Browse table data.
-* Insert, Update or Delete rows.
-* Load and unload databases at run-time (see `--enable-load` or `--enable-filesystem`)
-
-### Screenshots
-
-The index page shows some basic information about the database, including the
-number of tables and indexes, as well as its size on disk:
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-index.png)
-
-The `structure` tab displays information about the structure of the table,
-including columns, indexes, triggers, and foreign keys (if any exist). From
-this page you can also create, rename or drop columns and indexes.
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-structure.png)
-
-Columns are easy to add, drop or rename:
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-add-column.png)
-
-The `content` tab displays all the table data. Links in the table header can be
-used to sort the data, foreign-keys are shown as clickable links, and row-data
-can be copied easily:
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-content-1.png)
-
-The `query` tab allows you to execute queries on a table. The query results are
-displayed in a table and can be exported to either JSON or CSV. Multiple
-queries can be executed, and results for each will be displayed. Data-modifying
-queries report the number of rows changed.
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-query-1.png)
-
-The `import` tab supports importing CSV and JSON files into a table. There is
-an option to automatically create columns for any unrecognized keys in the
-import file:
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-import.png)
-
-The `export` tab supports exporting all, or a subset, of columns:
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-export.png)
-
-Basic INSERT, UPDATE and DELETE queries are supported:
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-insert.png)
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-update.png)
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-delete.png)
-
-When configured with `--enable-load` or `--enable-filesystem` additional
-databases can be loaded or unloaded at run-time:
-
-![](https://media.charlesleifer.com/blog/photos/sqlite-web-attach-db.png)
-
-### Command-line options
-
-The syntax for invoking sqlite-web is:
-
-```console
-
-$ sqlite_web [options] /path/to/database.db /path/to/another.db
-```
-
-The following options are available:
-
-* `-p`, `--port`: default is 8080
-* `-H`, `--host`: default is 127.0.0.1
-* `-d`, `--debug`: default is false
-* `-l`, `--log-file`: filename for application logs.
-* `-q`, `--quiet`: only log errors.
-* `-b`, `--browser`: open a web-browser when sqlite-web starts.
-* `-x`, `--no-browser`: do not open a web-browser when sqlite-web starts.
-* `-P`, `--password`: prompt for password to access sqlite-web.
-  Alternatively, the password can be stored in the "SQLITE_WEB_PASSWORD"
-  environment variable, in which case the application will not prompt for a
-  password, but will use the value from the environment.
-* `-r`, `--read-only`: open database in read-only mode.
-* `-R`, `--rows-per-page`: set pagination on content page, default 50 rows.
-* `-Q`, `--query-rows-per-page`: set pagination on query page, default 1000 rows.
-* `-T`, `--no-truncate`: disable ellipsis for long text values. If this option
-  is used, the full text value is always shown.
-* `-B`, `--base64`: BLOB data as base64 (default is hex).
-* `-e`, `--extension`: path or name of loadable extension(s). To load
-  multiple extensions, specify ``-e [path]`` for each extension.
-* `-s`, `--startup-hook`: path to a startup hook used to initialize the
-    connection before each request, e.g. `my.module.some_callable`. Should
-    accept one parameter, the `SqliteDatabase` instance.
-* `-f`, `--foreign-keys`: enable foreign-key constraint pragma.
-* `-u`, `--url-prefix`: URL prefix for application, e.g. "/sqlite-web".
-* `-L`, `--enable-load`: Enable loading additional databases at runtime (upload
-  only). For adding local databases use `--enable-filesystem`.
-* `-U`, `--upload-dir`: Destination directory for uploaded database. Only has
-  an effect together with `-L`. If not specified, a system tempdir is used.
-* `-F`, `--enable-filesystem`: Enable loading additional databases by
-  specifying on-disk path at runtime. **Be careful with this**.
-* `-c`, `--ssl-cert` and `-k`, `--ssl-key` - specify SSL cert and private key.
-* `-a`, `--ad-hoc` - run using an ad-hoc SSL context. Requires the
-  `cryptography` package (`pip install sqlite-web[ssl]`).
-
-### Using docker
-
-A Dockerfile is provided with sqlite-web. To use:
-
-```console
-#
-# Use GitHub container registry:
-#
-
-$ docker run -it --rm \
-    -p 8080:8080 \
-    -v /path/to/your-data:/data \
-    ghcr.io/coleifer/sqlite-web:latest \
-    db_filename.db
-
-#
-# OR build the image yourself (run from the repository root):
-#
-
-$ docker build -t coleifer/sqlite-web -f docker/Dockerfile .
-$ docker run -it --rm \
-    -p 8080:8080 \
-    -v /path/to/your-data:/data \
-    coleifer/sqlite-web \
-    db_filename.db
-```
-
-Command-line options can be passed in when running via Docker. For example, if
-you want to run it at a separate URL prefix, for example `/sqlite-web/`:
-
-```
-$ docker run -it --rm \
-    -p 8080:8080 \
-    -v /path/to/your-data:/data \
-    ghcr.io/coleifer/sqlite-web:latest \
-    db_filename.db \
-    --url-prefix="/sqlite-web/"
-```
-
-### High-performance WSGI Server
-
-To run sqlite-web with the high-performance gevent WSGI server, you can run
-`sqlite_wsgi` instead of `sqlite_web`:
-
-```console
-$ sqlite_wsgi /path/to/db.db
-```
-
-More complete example:
-
-```console
-$ sqlite_wsgi -p 8000 -H '0.0.0.0' /path/to/db1.db /path/to/db2.db
-```
+- 撤销可以逐条进行，但字段级操作（新建列、改名、改类型、删列）不支持「撤销的撤销」：
+  撤销一次之后，那一步不会再生成为可撤销的记录。
+- 删除列会连带删除该列上手工建的自定义索引，撤销删列只恢复数据与字段定义，不会把自定义
+  索引重建回来（系统自动索引会重建）。
+- 导出 CSV 时为防止公式注入，忽略前导空白后形似公式的文本会被加上一个前导单引号；这个
+  单引号是文件内容的一部分，再次导入会一起带进库里。
+- CSV 编码先按 UTF-8 试，失败再整体按 GB18030 解码。一个文件里混着多种编码时第二次解码
+  可能得到乱码；导入预览会把这些可疑行标出来，遇到时请另存为 UTF-8 再导入。
+- 程序只监听 `127.0.0.1`，不提供任何远程访问；需要多人协作请用分享包导出后各自导入。
