@@ -2,6 +2,10 @@
 
 分享包是一个 zip，只含两个条目：`manifest.json` 与 `db.sqlite`。
 导入只做校验、解压与改名，成功后由调用方作为**新库**打开（不合并）。
+
+manifest.json 只是随包的说明：格式版本、应用版本、导出时间与表清单仅用于展示与
+参考。导入后一律以库内实际内容为准，界面不要拿 manifest 的表清单当真（它可能与
+库里的实际结构不一致，也可能是被改写过的）。
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ import shutil
 import sqlite3
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 
 from .library import open_library
@@ -31,6 +36,9 @@ MAX_COMPRESSION_RATIO = 200
 # 小包不查压缩比：空的 SQLite 页几乎全是零字节，几 KB 的合法库压缩比也能过百，
 # 而这么小的包本身没有危害。
 _RATIO_CHECK_MIN_BYTES = 16 * 1024 * 1024
+
+# manifest 只是说明，正常不过几 KB；单独设上限，避免超大条目绕过解压总量检查。
+MAX_MANIFEST_BYTES = 1024 * 1024
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -96,6 +104,8 @@ def export_lsmf(conn: sqlite3.Connection, db_path, out_path, app_version: str):
 
 def _check_entries(infos: list) -> None:
     names = [info.filename for info in infos]
+    if len(set(names)) != len(names):
+        raise ShareError("分享包包含重名条目")
     if len(names) != len(ENTRY_NAMES) or set(names) != set(ENTRY_NAMES):
         raise ShareError(
             "分享包内容不符合预期：只允许 manifest.json 与 db.sqlite"
@@ -179,6 +189,14 @@ def _validate_database(path: Path) -> None:
     library.conn.close()
 
 
+def _package_stem(source: Path) -> str:
+    """分享包的文件名去掉扩展名作为库名；没有可用名字时回退为 shared。"""
+    stem = source.stem
+    if not stem or stem.startswith("."):
+        return "shared"
+    return stem
+
+
 def _unique_destination(directory: Path, stem: str) -> Path:
     candidate = directory / f"{stem}.sqlite"
     index = 2
@@ -197,21 +215,34 @@ def import_lsmf(path, libraries_dir):
     except (zipfile.BadZipFile, OSError) as exc:
         raise ShareError(f"分享包无法打开：{exc}") from None
 
-    with zf:
-        infos = zf.infolist()
-        _check_entries(infos)
-        _check_sizes(infos)
-        _check_format(_read_manifest(zf.read(MANIFEST_NAME)))
-        info = next(item for item in infos if item.filename == DB_NAME)
+    try:
+        with zf:
+            infos = zf.infolist()
+            _check_entries(infos)
+            _check_sizes(infos)
+            manifest_info = next(
+                item for item in infos if item.filename == MANIFEST_NAME
+            )
+            if manifest_info.file_size > MAX_MANIFEST_BYTES:
+                raise ShareError(
+                    f"manifest.json 过大（{manifest_info.file_size} 字节）"
+                )
+            _check_format(_read_manifest(zf.read(MANIFEST_NAME)))
+            db_info = next(item for item in infos if item.filename == DB_NAME)
 
-        directory.mkdir(parents=True, exist_ok=True)
-        workdir = Path(tempfile.mkdtemp(prefix=".tmp-", dir=str(directory)))
-        try:
-            extracted = workdir / DB_NAME
-            _extract_db(zf, info, extracted)
-            _validate_database(extracted)
-            destination = _unique_destination(directory, source.stem)
-            os.replace(extracted, destination)
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+            directory.mkdir(parents=True, exist_ok=True)
+            workdir = Path(tempfile.mkdtemp(prefix=".tmp-", dir=str(directory)))
+            try:
+                extracted = workdir / DB_NAME
+                _extract_db(zf, db_info, extracted)
+                _validate_database(extracted)
+                destination = _unique_destination(
+                    directory, _package_stem(source)
+                )
+                os.replace(extracted, destination)
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+    except (zipfile.BadZipFile, zlib.error, EOFError, RuntimeError) as exc:
+        # CRC 不符、压缩流截断或数据损坏都在读取条目时才暴露。
+        raise ShareError(f"分享包数据已损坏：{exc}") from None
     return destination

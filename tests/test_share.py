@@ -28,6 +28,7 @@ def make_lsmf(
     extra_entries=(),
     manifest=None,
     compresslevel=1,
+    stored=False,
 ):
     """构造一个分享包；fill_mb 用零字节填充 db.sqlite 以模拟 zip bomb。"""
     path = Path(directory) / name
@@ -36,7 +37,8 @@ def make_lsmf(
         if manifest is not None
         else json.dumps({"format": format, "app_version": "1.0.0"})
     )
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=compresslevel) as zf:
+    mode = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(path, "w", mode, compresslevel=compresslevel) as zf:
         zf.writestr("manifest.json", text)
         if fill_mb:
             with zf.open("db.sqlite", "w") as writer:
@@ -64,6 +66,20 @@ def bare_sqlite():
 
 def sqlite_bytes(path):
     return Path(path).read_bytes()
+
+
+def corrupt_payload(path, entry):
+    """原地破坏一个条目的载荷字节（长度不变），模拟压缩流损坏。"""
+    data = bytearray(Path(path).read_bytes())
+    with zipfile.ZipFile(path) as zf:
+        info = zf.getinfo(entry)
+    start = info.header_offset + 30
+    name_len = int.from_bytes(data[start - 4 : start - 2], "little")
+    extra_len = int.from_bytes(data[start - 2 : start], "little")
+    payload = start + name_len + extra_len
+    data[payload + info.compress_size // 2] ^= 0xFF
+    Path(path).write_bytes(bytes(data))
+    return path
 
 
 class BaseShareTestCase(unittest.TestCase):
@@ -211,6 +227,13 @@ class TestImportRoundTrip(BaseShareTestCase):
         self.assertEqual(Path(first).name, "dup.sqlite")
         self.assertEqual(Path(second).name, "dup-2.sqlite")
 
+    def test_import_falls_back_to_shared_name(self):
+        for name in (".lsmf", ".hidden.lsmf"):
+            with self.subTest(name=name):
+                dest = import_lsmf(make_lsmf(self.dir, name=name), self.dir)
+                self.assertEqual(Path(dest).name, "shared.sqlite")
+                Path(dest).unlink()
+
     def test_import_creates_libraries_dir(self):
         dest = import_lsmf(make_lsmf(self.dir), self.dir / "新建目录")
         self.assertTrue(Path(dest).exists())
@@ -234,6 +257,39 @@ class TestImportRejects(BaseShareTestCase):
         package = make_lsmf(self.dir, extra_entries=(("sub/db.sqlite", b"x"),))
         with self.assertRaises(ShareError):
             import_lsmf(package, self.dir)
+
+    def test_rejects_duplicate_entries(self):
+        bad = self.dir / "dupentry.lsmf"
+        with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", '{"format": 1}')
+            zf.writestr("db.sqlite", bare_sqlite())
+            zf.writestr("db.sqlite", bare_sqlite())
+        with self.assertRaises(ShareError):
+            import_lsmf(bad, self.dir)
+
+    def test_rejects_corrupted_entry(self):
+        """载荷被改动（CRC 不符）时抛 ShareError，而不是 leaking BadZipFile。"""
+        package = make_lsmf(self.dir, name="broken.lsmf", stored=True)
+        corrupt_payload(package, "db.sqlite")
+        with self.assertRaises(ShareError):
+            import_lsmf(package, self.dir)
+
+    def test_rejects_corrupted_manifest(self):
+        package = make_lsmf(self.dir, name="broken2.lsmf", stored=True)
+        corrupt_payload(package, "manifest.json")
+        with self.assertRaises(ShareError):
+            import_lsmf(package, self.dir)
+
+    def test_rejects_oversized_manifest(self):
+        bad = self.dir / "bigman.lsmf"
+        with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "manifest.json",
+                '{"format": 1, "pad": "' + "x" * (2 * 1024 * 1024) + '"}',
+            )
+            zf.writestr("db.sqlite", bare_sqlite())
+        with self.assertRaises(ShareError):
+            import_lsmf(bad, self.dir)
 
     def test_rejects_extra_entry(self):
         package = make_lsmf(self.dir, extra_entries=(("notes.txt", b"hi"),))
