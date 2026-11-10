@@ -47,6 +47,14 @@ def _to_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _tiebreaker_names(tiebreaker) -> list[str]:
+    if tiebreaker is None:
+        return []
+    if isinstance(tiebreaker, str):
+        return [tiebreaker]
+    return [str(name) for name in tiebreaker if name]
+
+
 def _date_part(value: object) -> str:
     """把日期取值归一成 YYYY-MM-DD；认不出时退回前 10 个字符。"""
     text = str(value).strip()
@@ -132,9 +140,12 @@ def page_sql(
     limit: int,
     offset: int,
     soft_delete: bool = True,
-    tiebreaker: str | None = '"id"',
+    tiebreaker: str | list | None = "id",
 ) -> tuple[str, list]:
-    """生成一页数据的查询；默认过滤软删行，并以 tiebreaker 保证跨页顺序稳定。"""
+    """生成一页数据的查询；默认过滤软删行，并以 tiebreaker 保证跨页顺序稳定。
+
+    tiebreaker 是列名（单个或列表），由本函数双引号转义，不接受裸 SQL 片段。
+    """
     names = {field.name for field in fields}
     where, params = build_where(view.filters, fields)
     conditions = []
@@ -161,8 +172,8 @@ def page_sql(
     order = build_order(sorts, group)
     if order:
         order_parts.append(order)
-    if tiebreaker:
-        order_parts.append(f"{tiebreaker} ASC")
+    for name in _tiebreaker_names(tiebreaker):
+        order_parts.append(f"{_quote(name)} ASC")
     if order_parts:
         sql += " ORDER BY " + ", ".join(order_parts)
     sql += " LIMIT ? OFFSET ?"

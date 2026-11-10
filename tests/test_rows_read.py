@@ -3,7 +3,7 @@ import unittest
 
 from local_sql_manager.services.library import ensure_meta
 from local_sql_manager.services.models import ViewConfig
-from local_sql_manager.services.rows import get_page
+from local_sql_manager.services.rows import _has_rowid, get_page
 from local_sql_manager.services.schema import ColumnSpec, create_table
 from local_sql_manager.services.util import utcnow_iso
 
@@ -133,6 +133,36 @@ class TestGetPage(unittest.TestCase):
         page = get_page(self.conn, "noid2", ViewConfig())
         self.assertEqual(page.total, 2)
         self.assertEqual(sorted(row["k"] for row in page.rows), ["a", "b"])
+
+    def test_rowid_detection_ignores_sql_comment(self):
+        self.conn.execute(
+            'CREATE TABLE "c1" ("a" TEXT /* WITHOUT ROWID */)'
+        )
+        self.assertTrue(_has_rowid(self.conn, "c1"))
+        self.conn.execute('INSERT INTO "c1" ("a") VALUES (?)', ("x",))
+        page = get_page(self.conn, "c1", ViewConfig())
+        self.assertEqual(page.rows[0]["a"], "x")
+
+    def test_rowid_detection_for_without_rowid_and_view(self):
+        self.conn.execute(
+            'CREATE TABLE "w1" ("k" TEXT PRIMARY KEY) WITHOUT ROWID'
+        )
+        self.conn.execute('CREATE VIEW "v1" AS SELECT 1 AS "x"')
+        self.assertFalse(_has_rowid(self.conn, "w1"))
+        self.assertFalse(_has_rowid(self.conn, "v1"))
+
+    def test_without_rowid_pages_by_primary_key(self):
+        self.conn.execute(
+            'CREATE TABLE "noid3" ("k" TEXT PRIMARY KEY, "v" TEXT) WITHOUT ROWID'
+        )
+        self.conn.executemany(
+            'INSERT INTO "noid3" ("k", "v") VALUES (?, ?)',
+            [("c", "3"), ("a", "1"), ("b", "2")],
+        )
+        first = get_page(self.conn, "noid3", ViewConfig(), page=1, page_size=2)
+        second = get_page(self.conn, "noid3", ViewConfig(), page=2, page_size=2)
+        self.assertEqual([row["k"] for row in first.rows], ["a", "b"])
+        self.assertEqual([row["k"] for row in second.rows], ["c"])
 
     def test_bad_page_falls_back_to_one(self):
         self.insert("完成", 10)

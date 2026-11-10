@@ -245,7 +245,32 @@ class TestPageSql(unittest.TestCase):
             soft_delete=False,
             tiebreaker="rowid",
         )
-        self.assertIn("ORDER BY rowid ASC", sql)
+        self.assertIn('ORDER BY "rowid" ASC', sql)
+
+    def test_tiebreaker_is_quoted_not_raw_sql(self):
+        sql, _ = page_sql(
+            "t",
+            [],
+            ViewConfig(),
+            limit=10,
+            offset=0,
+            soft_delete=False,
+            tiebreaker='1; DROP TABLE "c1"; --',
+        )
+        self.assertNotIn('DROP TABLE "c1"', sql)
+        self.assertIn('"1; DROP TABLE ""c1""; --" ASC', sql)
+
+    def test_tiebreaker_accepts_multiple_columns(self):
+        sql, _ = page_sql(
+            "t",
+            [],
+            ViewConfig(),
+            limit=10,
+            offset=0,
+            soft_delete=False,
+            tiebreaker=["b", "a"],
+        )
+        self.assertIn('ORDER BY "b" ASC, "a" ASC', sql)
 
 
 if __name__ == "__main__":

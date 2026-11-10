@@ -22,11 +22,19 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def _has_rowid(conn: sqlite3.Connection, table: str) -> bool:
-    """判断普通表是否有 rowid；WITHOUT ROWID 表只能靠扫描顺序。"""
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-    ).fetchone()
-    return row is not None and "WITHOUT ROWID" not in (row[0] or "").upper()
+    """用一次空查询判断 rowid 是否可用；视图与 WITHOUT ROWID 表会失败。"""
+    try:
+        conn.execute(f"SELECT rowid FROM {_quote(table)} LIMIT 0")
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
+def _pk_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """按主键序号返回主键列名；无主键时为空。"""
+    rows = conn.execute(f"PRAGMA table_info({_quote(table)})").fetchall()
+    ordered = sorted((row[5], row[1]) for row in rows if row[5])
+    return [name for _, name in ordered]
 
 
 def _conditions(view: ViewConfig, fields: list, soft_delete: bool) -> tuple[list, list]:
@@ -107,11 +115,11 @@ def get_page(
     soft_delete = _has_column(conn, table, "deleted_at")
     # 没有 id 列时退回 rowid，避免 ORDER BY "id" 被 SQLite 当成常量而静默失效。
     if _has_column(conn, table, "id"):
-        tiebreaker = '"id"'
+        tiebreaker = "id"
     elif _has_rowid(conn, table):
         tiebreaker = "rowid"
     else:
-        tiebreaker = None
+        tiebreaker = _pk_columns(conn, table) or None
 
     sql, params = page_sql(
         table,
