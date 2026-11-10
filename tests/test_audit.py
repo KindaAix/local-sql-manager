@@ -1,3 +1,6 @@
+import base64
+import datetime
+import decimal
 import json
 import re
 import sqlite3
@@ -87,6 +90,65 @@ class TestAudit(unittest.TestCase):
         audit.mark_undone(self.conn, op, undo_id)
         self.assertEqual(audit.get_op(self.conn, op)["undone_by"], undo_id)
         self.assertIsNone(audit.get_op(self.conn, undo_id)["undone_by"])
+
+
+    def test_payload_encodes_bytes_and_dates(self):
+        op = audit.record(
+            self.conn,
+            "import",
+            "订单",
+            "web",
+            {
+                "blob": b"\x00\x01",
+                "bytearray": bytearray(b"ab"),
+                "when": datetime.datetime(2026, 11, 10, 8, 0, 0),
+                "day": datetime.date(2026, 11, 10),
+                "money": decimal.Decimal("1.50"),
+            },
+        )
+        payload = audit.get_op(self.conn, op)["payload"]
+        self.assertEqual(payload["blob"], {"b64": "AAE="})
+        self.assertEqual(payload["bytearray"], {"b64": base64.b64encode(b"ab").decode()})
+        self.assertEqual(payload["when"], "2026-11-10T08:00:00")
+        self.assertEqual(payload["day"], "2026-11-10")
+        self.assertEqual(payload["money"], "1.50")
+
+    def test_unencodable_payload_raises(self):
+        with self.assertRaises(TypeError):
+            audit.record(self.conn, "update", "订单", "web", {"bad": object()})
+
+    def test_none_payload_becomes_empty_dict(self):
+        op = audit.record(self.conn, "update", "订单", "web", None)
+        self.assertEqual(audit.get_op(self.conn, op)["payload"], {})
+
+    def test_record_does_not_commit(self):
+        op = audit.record(self.conn, "update", "订单", "web", {})
+        self.conn.rollback()
+        self.assertIsNone(audit.get_op(self.conn, op))
+
+    def test_mark_undone_does_not_commit(self):
+        op = audit.record(self.conn, "insert", "订单", "web", {})
+        undo_id = audit.record(self.conn, "undo", "订单", "web", {"op": op})
+        self.conn.commit()
+        self.assertEqual(audit.mark_undone(self.conn, op, undo_id), 1)
+        self.conn.rollback()
+        self.assertIsNone(audit.get_op(self.conn, op)["undone_by"])
+
+    def test_mark_undone_is_idempotent_and_reports_rowcount(self):
+        op = audit.record(self.conn, "insert", "订单", "web", {})
+        undo_one = audit.record(self.conn, "undo", "订单", "web", {})
+        undo_two = audit.record(self.conn, "undo", "订单", "web", {})
+        self.assertEqual(audit.mark_undone(self.conn, op, undo_one), 1)
+        self.assertEqual(audit.mark_undone(self.conn, op, undo_two), 0)
+        self.assertEqual(audit.get_op(self.conn, op)["undone_by"], undo_one)
+        self.assertEqual(audit.mark_undone(self.conn, 999, undo_one), 0)
+
+    def test_history_clamps_limit(self):
+        for _ in range(3):
+            audit.record(self.conn, "update", "订单", "web", {})
+        self.assertEqual(audit.history(self.conn, limit=0), [])
+        self.assertEqual(audit.history(self.conn, limit=-5), [])
+        self.assertEqual(len(audit.history(self.conn, limit=501)), 3)
 
 
 if __name__ == "__main__":
