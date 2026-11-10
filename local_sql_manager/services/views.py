@@ -1,8 +1,11 @@
 """视图配置的增删改查。
 
-视图只是元数据：每张表至少有一个默认视图「全部记录」，它由 list_views
-在首次读取时懒创建，且不可删除。所有写函数都不提交事务，由调用方在
-同一事务内 commit；视图配置变化不写审计（见设计文档 §7.3）。
+视图只是元数据：每张表至少有一个默认视图「全部记录」，但默认视图在
+首次读取时只以内存对象返回，不写库；只有 create_view 才落库。默认视图
+不可删除。所有写函数都不提交事务，由调用方在同一事务内 commit。
+
+审计只覆盖视图本身的增删改名（kind='view'），纯配置更新（筛选、排序、
+隐藏列、列宽、分组）不记，见设计文档 §7.5。
 """
 
 from __future__ import annotations
@@ -11,20 +14,20 @@ import json
 import sqlite3
 from dataclasses import asdict, fields as dc_fields
 
+from . import audit
 from .models import ViewConfig
 from .schema import get_fields
 
 DEFAULT_VIEW_NAME = "全部记录"
+
+# 视图操作统一记为来自界面；MCP 若需区分可后续加 source 参数。
+_SOURCE = "web"
 
 _COLUMNS = (
     'SELECT "id", "table_name", "name", "config_json", "position", "is_default"'
     ' FROM "__lsm_view"'
 )
 _CONFIG_FIELDS = {item.name for item in dc_fields(ViewConfig)}
-
-
-def _quote(name: str) -> str:
-    return '"' + str(name).replace('"', '""') + '"'
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -55,22 +58,20 @@ def _prune(config: ViewConfig, table: str, conn: sqlite3.Connection) -> ViewConf
     def known_column(item: object) -> bool:
         return isinstance(item, dict) and item.get("column") in known
 
-    hidden = [name for name in config.hidden or [] if name in known]
-    order = [name for name in config.order or [] if name in known]
-    widths = {
-        name: width
-        for name, width in (config.widths or {}).items()
-        if name in known
-    }
-    group = config.group if known_column(config.group) else None
     return ViewConfig(
         filters=[item for item in config.filters or [] if known_column(item)],
         sorts=[item for item in config.sorts or [] if known_column(item)],
-        hidden=hidden,
-        order=order,
-        widths=widths,
-        group=group,
-        aggregates=[item for item in config.aggregates or [] if known_column(item)],
+        hidden=[name for name in config.hidden or [] if name in known],
+        order=[name for name in config.order or [] if name in known],
+        widths={
+            name: width
+            for name, width in (config.widths or {}).items()
+            if name in known
+        },
+        group=config.group if known_column(config.group) else None,
+        aggregates=[
+            item for item in config.aggregates or [] if known_column(item)
+        ],
     )
 
 
@@ -98,8 +99,15 @@ def _to_dict(row: sqlite3.Row | tuple) -> dict:
     }
 
 
-def _fetch(conn: sqlite3.Connection, view_id: int):
+def _fetch(conn: sqlite3.Connection, view_id: int | None):
+    if view_id is None:
+        return None
     return conn.execute(_COLUMNS + ' WHERE "id" = ?', (view_id,)).fetchone()
+
+
+def _record(conn: sqlite3.Connection, table: str, payload: dict) -> int:
+    """写一条视图审计；不提交事务。"""
+    return audit.record(conn, "view", table, _SOURCE, payload)
 
 
 def default_view(table: str) -> dict:
@@ -108,9 +116,9 @@ def default_view(table: str) -> dict:
 
 
 def list_views(conn: sqlite3.Connection, table: str) -> list[dict]:
-    """按 position 列出视图；该表没有任何视图时补建默认视图。
+    """按 position 列出视图；没有任何视图时返回内存中的默认视图。
 
-    表不存在时返回空列表。本函数可能写入一条默认视图，不提交事务。
+    默认视图不落库，id 为 None；表不存在时返回空列表。本函数只读。
     """
     if not _table_exists(conn, table):
         return []
@@ -118,24 +126,26 @@ def list_views(conn: sqlite3.Connection, table: str) -> list[dict]:
         _COLUMNS + ' WHERE "table_name" = ? ORDER BY "position", "id"', (table,)
     ).fetchall()
     if not rows:
-        conn.execute(
-            """
-            INSERT INTO "__lsm_view"
-                ("table_name", "name", "config_json", "position", "is_default")
-            VALUES (?, ?, ?, 0, 1)
-            """,
-            (table, DEFAULT_VIEW_NAME, _encode(ViewConfig())),
-        )
-        rows = conn.execute(
-            _COLUMNS + ' WHERE "table_name" = ? ORDER BY "position", "id"', (table,)
-        ).fetchall()
+        return [
+            {
+                "id": None,
+                "table": table,
+                "name": DEFAULT_VIEW_NAME,
+                "config": ViewConfig(),
+                "position": 0,
+                "is_default": True,
+            }
+        ]
     return [_to_dict(row) for row in rows]
 
 
 def create_view(
     conn: sqlite3.Connection, table: str, name: str, config: ViewConfig | dict
 ) -> int:
-    """在表末尾新增视图，返回 __lsm_view.id；表还没有默认视图时新视图即默认。"""
+    """在表末尾新增视图并记审计，返回 __lsm_view.id。
+
+    表还没有默认视图时，新视图即默认视图。不提交事务。
+    """
     _require_table(conn, table)
     name = (name or "").strip()
     if not name:
@@ -155,7 +165,9 @@ def create_view(
         """,
         (table, name, _encode(cleaned), position, 0 if has_default else 1),
     )
-    return cur.lastrowid
+    view_id = cur.lastrowid
+    _record(conn, table, {"action": "create", "name": name, "view_id": view_id})
+    return view_id
 
 
 def update_view(
@@ -164,7 +176,7 @@ def update_view(
     config: ViewConfig | dict,
     name: str | None = None,
 ) -> None:
-    """替换视图配置；name 不为 None 时同时重命名。不提交事务。"""
+    """替换视图配置；name 不为 None 时重命名并记审计。不提交事务。"""
     row = _fetch(conn, view_id)
     if row is None:
         raise ValueError("视图不存在")
@@ -182,16 +194,28 @@ def update_view(
         'UPDATE "__lsm_view" SET "config_json" = ?, "name" = ? WHERE "id" = ?',
         (_encode(cleaned), name, view_id),
     )
+    if name != row[2]:
+        _record(
+            conn,
+            row[1],
+            {
+                "action": "rename",
+                "name": name,
+                "old_name": row[2],
+                "view_id": view_id,
+            },
+        )
 
 
 def delete_view(conn: sqlite3.Connection, view_id: int) -> None:
-    """删除视图；默认视图不可删除。不提交事务。"""
+    """删除视图并记审计；默认视图不可删除。不提交事务。"""
     row = _fetch(conn, view_id)
     if row is None:
         raise ValueError("视图不存在")
     if row[5]:
         raise ValueError("默认视图不能删除")
     conn.execute('DELETE FROM "__lsm_view" WHERE "id" = ?', (view_id,))
+    _record(conn, row[1], {"action": "delete", "name": row[2], "view_id": view_id})
 
 
 def set_default(conn: sqlite3.Connection, table: str, view_id: int) -> None:
@@ -207,8 +231,8 @@ def set_default(conn: sqlite3.Connection, table: str, view_id: int) -> None:
     conn.execute('UPDATE "__lsm_view" SET "is_default" = 1 WHERE "id" = ?', (view_id,))
 
 
-def load_config(conn: sqlite3.Connection, view_id: int) -> ViewConfig:
-    """读取视图配置；视图不存在时返回空配置。"""
+def load_config(conn: sqlite3.Connection, view_id: int | None) -> ViewConfig:
+    """读取视图配置；视图不存在或 view_id 为 None 时返回空配置。"""
     row = _fetch(conn, view_id)
     if row is None:
         return ViewConfig()
