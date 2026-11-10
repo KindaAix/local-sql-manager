@@ -212,6 +212,32 @@ class TestTableOps(unittest.TestCase):
         with self.assertRaises(ValueError):
             rename_table(self.conn, "订单", "  ")
 
+    def test_rename_rejects_case_only_collision(self):
+        create_table(self.conn, "abc", [ColumnSpec("a", "text")])
+        with self.assertRaises(ValueError):
+            rename_table(self.conn, "abc", "ABC")
+
+    def test_rename_rejects_view_name(self):
+        self.conn.execute('CREATE VIEW "报表" AS SELECT 1 AS "x"')
+        with self.assertRaises(ValueError):
+            rename_table(self.conn, "订单", "报表")
+
+    def test_rename_strips_new_name(self):
+        rename_table(self.conn, "订单", "  发票  ")
+        self.assertIn("发票", list_tables(self.conn))
+
+    def test_restore_rejects_ghost_trash_entry(self):
+        op = drop_table(self.conn, "订单")
+        self.conn.execute(f'DROP TABLE "__lsm_trash_{op}_订单"')
+        with self.assertRaises(ValueError):
+            restore_table(self.conn, "订单")
+
+    def test_purge_rejects_ghost_trash_entry(self):
+        op = drop_table(self.conn, "订单")
+        self.conn.execute(f'DROP TABLE "__lsm_trash_{op}_订单"')
+        with self.assertRaises(ValueError):
+            purge_table(self.conn, "订单")
+
     def test_purge_rejects_active_table(self):
         with self.assertRaises(ValueError):
             purge_table(self.conn, "订单")

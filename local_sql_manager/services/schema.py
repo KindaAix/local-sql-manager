@@ -161,16 +161,38 @@ def _reject_reserved_name(name: str) -> None:
         raise ValueError(f"表名不能使用内部前缀：{name}")
 
 
-def _ensure_user_table(conn: sqlite3.Connection, table: str) -> None:
+def _ensure_user_table(conn: sqlite3.Connection, table: str) -> str:
+    """校验是可操作的真实表，并返回库里登记的大小写形式。"""
     if str(table).lower().startswith(("__lsm_", "sqlite_")):
         raise ValueError(f"不能操作内部表：{table}")
-    if not _table_exists(conn, table):
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+        " AND name = ? COLLATE NOCASE",
+        (table,),
+    ).fetchone()
+    if row is None:
         raise ValueError(f"表不存在：{table}")
+    return row[0]
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """库里是否真的有这张表（大小写不敏感）。"""
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+        " AND name = ? COLLATE NOCASE",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _name_taken(conn: sqlite3.Connection, name: str) -> bool:
+    """表名是否已被表、视图或索引占用。
+
+    SQLite 的对象名大小写不敏感且共享命名空间；改名的目标名必须按此判断，
+    否则会漏过预检，最后抛 sqlite3.OperationalError 的英文原文。
+    """
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ? COLLATE NOCASE", (name,)
     ).fetchone()
     return row is not None
 
@@ -245,13 +267,14 @@ def rename_table(
 
     调用方若已开启事务，本函数加入该事务；否则自身提交。
     """
-    if not str(new).strip():
+    new = str(new).strip()
+    if not new:
         raise ValueError("表名不能为空")
     _reject_reserved_name(new)
-    _ensure_user_table(conn, old)
+    old = _ensure_user_table(conn, old)
     if new == old:
         raise ValueError("新表名与原表名相同")
-    if _table_exists(conn, new):
+    if _name_taken(conn, new):
         raise ValueError(f"表已存在：{new}")
     with _savepoint(conn, "lsm_rename_table"):
         op = audit.record(
@@ -266,7 +289,7 @@ def drop_table(conn: sqlite3.Connection, table: str, source: str = "web") -> int
 
     调用方若已开启事务，本函数加入该事务；否则自身提交。
     """
-    _ensure_user_table(conn, table)
+    table = _ensure_user_table(conn, table)
     with _savepoint(conn, "lsm_drop_table"):
         op = audit.record(conn, "drop_table", table, source, {"name": table})
         physical = f"{TRASH_PREFIX}{op}_{table}"
@@ -312,9 +335,11 @@ def restore_table(conn: sqlite3.Connection, table: str, source: str = "web") -> 
     if not candidates:
         raise ValueError(f"回收站中没有该表：{table}")
     physical = candidates[-1][1]
+    if not _table_exists(conn, physical):
+        raise ValueError(f"回收站中的表已不存在：{physical}")
     target = table
     suffix = 2
-    while _table_exists(conn, target):
+    while _name_taken(conn, target):
         target = f"{table}_{suffix}"
         suffix += 1
     with _savepoint(conn, "lsm_restore_table"):
@@ -349,6 +374,8 @@ def purge_table(conn: sqlite3.Connection, table: str, source: str = "web") -> in
         if not candidates:
             raise ValueError(f"回收站中没有该表：{table}")
         name, physical = table, candidates[-1][1]
+    if not _table_exists(conn, physical):
+        raise ValueError(f"回收站中的表已不存在：{physical}")
     with _savepoint(conn, "lsm_purge_table"):
         op = audit.record(
             conn,
