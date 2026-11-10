@@ -212,6 +212,141 @@ def _clear_metadata(conn: sqlite3.Connection, table: str) -> None:
         conn.execute(f'DELETE FROM "{meta}" WHERE "table_name" = ?', (table,))
 
 
+# 这些错误说明 RENAME 重解析 schema 时被失效的视图/触发器挡住，可以退回
+# legacy 模式重试；其它 OperationalError 原样抛出。
+_LEGACY_RENAME_HINTS = ("error in view", "error in trigger", "no such table")
+
+
+def _count_table_references(sql: str, table: str) -> int:
+    """统计 SQL 中 table 的出现次数（大小写不敏感，支持引号标识符）。
+
+    只跳过字符串字面量与注释，其余按「出现即算引用」处理：列名与表名同名
+    时会多报，但不会漏掉真正的 view/trigger 引用。
+    """
+    target = table.lower()
+    count = 0
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "'":
+            index += 1
+            while index < length:
+                if sql[index] == "'":
+                    if index + 1 < length and sql[index + 1] == "'":
+                        index += 2
+                        continue
+                    break
+                index += 1
+            index += 1
+            continue
+        if sql[index : index + 2] == "--":
+            newline = sql.find("\n", index)
+            index = length if newline < 0 else newline + 1
+            continue
+        if sql[index : index + 2] == "/*":
+            end = sql.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        if char in ('"', "\x60", "["):
+            closer = "]" if char == "[" else char
+            index += 1
+            start = index
+            parts: list[str] = []
+            while index < length:
+                if sql[index] == closer:
+                    if (
+                        closer != "]"
+                        and index + 1 < length
+                        and sql[index + 1] == closer
+                    ):
+                        parts.append(sql[start:index])
+                        parts.append(closer)
+                        index += 2
+                        start = index
+                        continue
+                    break
+                index += 1
+            parts.append(sql[start:index])
+            if "".join(parts).lower() == target:
+                count += 1
+            index += 1
+            continue
+        if char.isalnum() or char == "_" or ord(char) > 127:
+            start = index
+            while index < length and (
+                sql[index].isalnum()
+                or sql[index] == "_"
+                or ord(sql[index]) > 127
+            ):
+                index += 1
+            if sql[start:index].lower() == target:
+                count += 1
+            continue
+        index += 1
+    return count
+
+
+def _sql_references_table(sql: str, table: str) -> bool:
+    return _count_table_references(sql, table) > 0
+
+
+def _referencing_objects(
+    conn: sqlite3.Connection, table: str
+) -> list[str]:
+    """返回 legacy 改名后会悬挂在旧表名上的 view / trigger 名。
+
+    挂在本表上的 trigger，ON 子句本身就会出现一次表名；若出现次数 > 1，
+    说明触发器体/WHEN 里又引用了本表，legacy RENAME 不会改写触发器体，
+    必须计入；恰好 1 次视为只挂在自身上，可安全回退。
+    """
+    names: list[str] = []
+    for row in conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master"
+        " WHERE sql IS NOT NULL AND type IN ('view', 'trigger')"
+    ):
+        kind, name, tbl_name, sql = row[0], row[1], row[2], row[3]
+        count = _count_table_references(sql, table)
+        if kind == "trigger" and str(tbl_name).lower() == table.lower():
+            if count > 1:
+                names.append(name)
+            continue
+        if count > 0:
+            names.append(name)
+    return names
+
+
+def _rename_table_strict(conn: sqlite3.Connection, old: str, new: str) -> None:
+    """优先用 modern 语义改表名（视图/触发器引用跟随新名），必要时回退 legacy。
+
+    SQLite 3.25+ 的 RENAME 会重解析整个 schema：库里只要存在引用不存在对象
+    的坏视图/触发器，连无关表的改名也会失败。此时若没有其它 view/触发器
+    引用本表，可安全退回 legacy（只改 schema 文本、不重写引用）；若仍有引用，
+    回退会让引用悬挂在旧名上，必须报错让用户先修复。
+    连接上原本开启 legacy 时，首次尝试前先关掉，确保 modern 语义真正生效。
+    """
+    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    if legacy:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+    try:
+        try:
+            conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+            return
+        except sqlite3.OperationalError as exc:
+            if not any(hint in str(exc).lower() for hint in _LEGACY_RENAME_HINTS):
+                raise
+            references = _referencing_objects(conn, old)
+            if references:
+                raise ValueError(
+                    "库中存在损坏的视图或触发器，且仍有对象引用该表"
+                    f"（{'、'.join(references)}），请先修复后再操作"
+                ) from exc
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table={1 if legacy else 0}")
+
+
 def _relocate_table(conn: sqlite3.Connection, old: str, new: str) -> None:
     """把表 old 改名为 new，字段/视图元数据与自动索引一并跟随。
 
@@ -227,7 +362,7 @@ def _relocate_table(conn: sqlite3.Connection, old: str, new: str) -> None:
         )
         if row[0].startswith(_index_prefix(old))
     ]
-    conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+    _rename_table_strict(conn, old, new)
     _clear_metadata(conn, new)
     for meta in ("__lsm_table", "__lsm_field", "__lsm_view"):
         conn.execute(
