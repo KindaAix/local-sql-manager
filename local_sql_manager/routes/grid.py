@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from datetime import datetime, timezone
 
 from flask import Blueprint, redirect, render_template, request, url_for
 
@@ -21,6 +23,10 @@ DEFAULT_PAGE_SIZE = 100
 # 受管表固定带这四个辅助列；界面上只展示后两个，id 与 deleted_at 不出现。
 HIDDEN_AUX_COLUMNS = ("id", "deleted_at")
 AUX_DISPLAY_COLUMNS = ("created_at", "updated_at")
+
+# 辅助列的时间存储是 UTC ISO8601，界面按本地时区展示，所以单独标一个类型。
+LOCAL_TIME_TYPE = "local_time"
+AUX_COLUMN_WIDTH = 160
 
 AGGREGATE_LABELS = {
     "sum": "求和",
@@ -78,14 +84,41 @@ def _business_fields(conn, table: str) -> list:
 
 
 def _display_columns(conn, table: str, fields: list, config) -> list:
-    """业务列（按字段顺序、跳过隐藏）+ 只读辅助列。"""
+    """业务列 + 只读辅助列；业务列顺序与宽度取自视图配置。"""
     hidden = set(config.hidden or [])
-    columns = [field for field in fields if field.name not in hidden]
+    widths = config.widths or {}
+    by_name = {field.name: field for field in fields}
+
+    ordered: list = []
+    seen: set[str] = set()
+    for name in config.order or []:
+        field = by_name.get(name)
+        if field is None or name in hidden or name in seen:
+            continue
+        ordered.append(field)
+        seen.add(name)
+    for field in fields:
+        if field.name in hidden or field.name in seen:
+            continue
+        ordered.append(field)
+        seen.add(field.name)
+
+    columns = [_with_width(field, widths.get(field.name)) for field in ordered]
     physical = set(_table_columns(conn, table))
     for name in AUX_DISPLAY_COLUMNS:
         if name in physical:
-            columns.append(Field(name=name, type="text"))
+            columns.append(
+                Field(name=name, type=LOCAL_TIME_TYPE, width=AUX_COLUMN_WIDTH)
+            )
     return columns
+
+
+def _with_width(field: Field, raw_width: object) -> Field:
+    """配置里的列宽优先；非法值回落到字段自身的默认宽度。"""
+    width = _parse_int(raw_width)
+    if width is None or width <= 0:
+        return field
+    return replace(field, width=width)
 
 
 def _select_view(options: list, raw: object) -> dict:
@@ -117,6 +150,21 @@ def _cell_filter(value: object) -> str:
     return display_text(value)
 
 
+@bp.app_template_filter("local_time")
+def _local_time_filter(value: object) -> str:
+    """UTC ISO8601 → 本地时间 YYYY-MM-DD HH:MM；认不出时原样返回。"""
+    text = display_text(value)
+    if not text:
+        return ""
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 def _aggregate_labels(config, fields: list) -> list[str]:
     """与 Group.aggregates 一一对齐的汇总标题；无效配置留空串占位。"""
     by_name = {field.name: field for field in fields}
@@ -135,17 +183,30 @@ def _aggregate_labels(config, fields: list) -> list[str]:
 
 
 def _group_label(value: object) -> str:
-    return "（空）" if value is None else display_text(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "（空）"
+    return display_text(value)
+
+
+def _group_offsets(groups: tuple) -> dict:
+    """每组在整个筛选集里的起始行号（0 起），用于判断组是否跨页。"""
+    offsets: dict = {}
+    running = 0
+    for item in groups:
+        offsets[item.key] = running
+        running += item.count
+    return offsets
 
 
 def _build_blocks(result, config, fields: list) -> list | None:
-    """按本页行序切成组块，供模板插入组头行；未分组时返回 None。"""
+    """按本页行序切成组块，供模板插入组头行；未分组或无行时返回 None。"""
     group = config.group if isinstance(config.group, dict) else None
     column = group.get("column") if group else None
-    if not column or not result.groups:
+    if not column or not result.groups or not result.rows:
         return None
 
     labels = _aggregate_labels(config, fields)
+    offsets = _group_offsets(result.groups)
     by_key = {item.key: item for item in result.groups}
     blocks: list[dict] = []
     for row in result.rows:
@@ -157,6 +218,7 @@ def _build_blocks(result, config, fields: list) -> list | None:
                     "key": key,
                     "label": _group_label(key),
                     "count": info.count if info is not None else 0,
+                    "offset": offsets.get(key, 0),
                     "values": list(info.aggregates) if info is not None else [],
                     "continued": False,
                     "rows": [],
@@ -164,9 +226,11 @@ def _build_blocks(result, config, fields: list) -> list | None:
             )
         blocks[-1]["rows"].append(row)
 
-    # 组跨页时只有本页第一个组块需要标「（续）」：它是上一页未完的那一组。
+    # 「（续）」只在组从上一页延续下来时出现：组在本页开始则不标。
+    # 判定依据是组在筛选集中的起始行号是否落在上一页范围内。
+    page_start = (result.page - 1) * result.page_size
     head = blocks[0]
-    head["continued"] = result.page > 1 and head["count"] > len(head["rows"])
+    head["continued"] = result.page > 1 and head["offset"] < page_start
 
     for block in blocks:
         block["aggregates"] = [
@@ -189,7 +253,7 @@ def index():
     return redirect(url_for("grid.table_view", table=tables[0]))
 
 
-@bp.get("/t/<table>/")
+@bp.get("/t/<path:table>/")
 def table_view(table: str):
     conn = get_conn()
     tables = schema.list_tables(conn)
@@ -210,7 +274,21 @@ def table_view(table: str):
     config = views.load_config(conn, active["id"])
 
     size = _parse_size(request.args.get("size"))
-    result = rows.get_page(conn, table, config, _parse_page(request.args.get("page")), size)
+    requested_page = _parse_page(request.args.get("page"))
+    result = rows.get_page(conn, table, config, requested_page, size)
+    total_pages = max(1, math.ceil(result.total / size))
+
+    # page 是用户可改的参数：越过末页时重定向到最后一页，避免空页与假页脚。
+    if requested_page > total_pages:
+        return redirect(
+            url_for(
+                "grid.table_view",
+                table=table,
+                view=active["id"],
+                page=total_pages,
+                size=size,
+            )
+        )
 
     fields = _business_fields(conn, table)
     columns = _display_columns(conn, table, fields, config)
@@ -237,7 +315,7 @@ def table_view(table: str):
         groups=result.groups,
         size=size,
         page_sizes=PAGE_SIZES,
-        total_pages=max(1, math.ceil(result.total / size)),
+        total_pages=total_pages,
         first_row=first_row,
         last_row=last_row,
         managed=_is_managed(conn, table),

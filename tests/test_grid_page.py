@@ -1,8 +1,10 @@
 """网格页面的渲染与路由测试。"""
 
 import os
+import re
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from local_sql_manager.app import create_app
@@ -12,7 +14,7 @@ from local_sql_manager.services.schema import ColumnSpec
 
 
 class GridPageTest(unittest.TestCase):
-    """一张受管的「订单」表，三条数据，其中一条之后软删。"""
+    """一张受管的「订单」表，三条数据。"""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -60,6 +62,8 @@ class GridPageTest(unittest.TestCase):
         self.assertIn("全部记录", html)
         self.assertIn("SO-2026-0148", html)
         self.assertNotIn("badge-readonly", html)
+        self.assertIn('aria-current="page"', html)
+        self.assertIn('scope="col"', html)
 
     def test_soft_deleted_rows_are_hidden(self):
         op = rows.soft_delete(self.conn, "订单", [1])
@@ -86,6 +90,34 @@ class GridPageTest(unittest.TestCase):
         self.assertNotIn("SO-2026-0148", second)
         self.assertIn("共 60 行", first)
         self.assertIn("共 60 行", second)
+
+    def test_page_beyond_last_redirects_to_last_page(self):
+        rows.insert_rows(
+            self.conn,
+            "订单",
+            [{"单号": f"SO-BULK-{index}", "金额": index, "状态": "已发货"} for index in range(60)],
+        )
+        self.conn.commit()
+        response = self.client.get("/t/订单/?size=50&page=9")
+        self.assertEqual(response.status_code, 302)
+        location = unquote(response.headers["Location"])
+        self.assertIn("page=2", location)
+        self.assertIn("size=50", location)
+
+    def test_out_of_range_page_never_500(self):
+        # 普通视图：page=999 夹取到最后一页。
+        response = self.client.get("/t/订单/?page=999")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("page=1", unquote(response.headers["Location"]))
+
+        # 分组视图：越界页也不得因为空组块抛 IndexError。
+        view_id = views.create_view(
+            self.conn, "订单", "按状态", {"group": {"column": "状态"}}
+        )
+        self.conn.commit()
+        response = self.client.get(f"/t/订单/?view={view_id}&page=99")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("page=1", unquote(response.headers["Location"]))
 
     def test_view_filter_limits_rows(self):
         view_id = views.create_view(
@@ -132,6 +164,14 @@ class GridPageTest(unittest.TestCase):
         self.assertEqual(self.client.get("/t/没有这张表/").status_code, 404)
         self.assertEqual(self.client.get("/t/__lsm_meta/").status_code, 404)
 
+    def test_missing_table_page_keeps_sidebar(self):
+        response = self.client.get("/t/没有这张表/")
+        self.assertEqual(response.status_code, 404)
+        html = response.get_data(as_text=True)
+        self.assertIn("找不到这张表", html)
+        self.assertIn("sidebar", html)
+        self.assertIn("订单", html)
+
     def test_group_view_shows_counts_and_aggregates(self):
         view_id = views.create_view(
             self.conn,
@@ -163,6 +203,44 @@ class GridPageTest(unittest.TestCase):
         self.assertNotIn("（续）", first)
         self.assertIn("（续）", second)
 
+    def test_group_continuation_uses_group_offset(self):
+        # 50 行 A + 55 行 B：B 从第 2 页第一行开始，不该标（续）；第 3 页才续。
+        schema.create_table(self.conn, "边界表", [ColumnSpec("类别", "text")])
+        rows.insert_rows(
+            self.conn,
+            "边界表",
+            [{"类别": "A"} for _ in range(50)] + [{"类别": "B"} for _ in range(55)],
+        )
+        view_id = views.create_view(
+            self.conn, "边界表", "按类别", {"group": {"column": "类别"}}
+        )
+        self.conn.commit()
+
+        first = self.html(f"/t/边界表/?view={view_id}&size=50")
+        second = self.html(f"/t/边界表/?view={view_id}&size=50&page=2")
+        third = self.html(f"/t/边界表/?view={view_id}&size=50&page=3")
+
+        self.assertNotIn("（续）", first)
+        self.assertNotIn("（续）", second)
+        self.assertIn("共 55 条", second)
+        self.assertIn("（续）", third)
+
+    def test_group_label_marks_blank_values(self):
+        # 写入层会把空串归一成 NULL，这里直接落库造出「空串」与「NULL」两组。
+        schema.create_table(self.conn, "空值表", [ColumnSpec("类别", "text")])
+        for value in ("", None, "有值"):
+            self.conn.execute(
+                'INSERT INTO "空值表" ("类别", "created_at", "updated_at")'
+                " VALUES (?, ?, ?)",
+                (value, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+        view_id = views.create_view(
+            self.conn, "空值表", "按类别", {"group": {"column": "类别"}}
+        )
+        self.conn.commit()
+        html = self.html(f"/t/空值表/?view={view_id}")
+        self.assertGreaterEqual(html.count("（空）"), 2)
+
     def test_unmanaged_table_is_read_only(self):
         self.conn.execute('CREATE TABLE "外部表" ("编号" TEXT, "说明" TEXT)')
         self.conn.execute('INSERT INTO "外部表" ("编号", "说明") VALUES (?, ?)', ("X-1", "外部数据"))
@@ -178,20 +256,88 @@ class GridPageTest(unittest.TestCase):
         self.conn.commit()
         html = self.html("/t/空表/")
         self.assertIn("还没有数据", html)
+        self.assertIn("暂无数据", html)
 
-    def test_pager_links_keep_view_and_size(self):
+    def test_pager_links_carry_view_page_and_size(self):
         view_id = views.create_view(self.conn, "订单", "全部", {})
-        self.conn.commit()
         rows.insert_rows(
             self.conn,
             "订单",
             [{"单号": f"SO-BULK-{index}", "金额": index, "状态": "已发货"} for index in range(60)],
         )
         self.conn.commit()
+
         html = self.html(f"/t/订单/?view={view_id}&size=50")
-        self.assertIn(f"view={view_id}", html)
-        self.assertIn("size=50", html)
-        self.assertIn("size=200", html)
+        next_links = re.findall(r'<a class="pager-link" href="([^"]+)">下一页</a>', html)
+        self.assertEqual(len(next_links), 1)
+        href = next_links[0].replace("&amp;", "&")
+        self.assertIn("page=2", href)
+        self.assertIn(f"view={view_id}", href)
+        self.assertIn("size=50", href)
+        # page=1 时上一页只是禁用文本，不应有链接。
+        self.assertNotIn(">上一页</a>", html)
+        self.assertIn(">上一页</span>", html)
+
+        second = self.html(f"/t/订单/?view={view_id}&size=50&page=2")
+        prev_links = re.findall(r'<a class="pager-link" href="([^"]+)">上一页</a>', second)
+        self.assertEqual(len(prev_links), 1)
+        prev = prev_links[0].replace("&amp;", "&")
+        self.assertIn("page=1", prev)
+        self.assertIn(f"view={view_id}", prev)
+        self.assertIn("size=50", prev)
+
+    def test_view_order_and_widths_apply(self):
+        view_id = views.create_view(
+            self.conn,
+            "订单",
+            "列序",
+            {"order": ["金额"], "widths": {"金额": 220}, "hidden": ["状态"]},
+        )
+        self.conn.commit()
+        html = self.html(f"/t/订单/?view={view_id}")
+        heads = re.findall(
+            r'<th class="grid-head" scope="col" style="width: (\d+)px">([^<]+)</th>', html
+        )
+        names = [name for _, name in heads]
+        self.assertEqual(names[:3], ["金额", "单号", "created_at"])
+        self.assertNotIn("状态", names)
+        self.assertEqual(heads[0][0], "220")
+
+    def test_auxiliary_columns_show_local_time(self):
+        self.conn.execute(
+            'INSERT INTO "订单" ("单号", "金额", "状态", "created_at", "updated_at")'
+            " VALUES (?, ?, ?, ?, ?)",
+            ("SO-OLD", 1, "已发货", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        self.conn.commit()
+        html = self.html("/t/订单/")
+        expected = datetime(2026, 1, 1, tzinfo=timezone.utc).astimezone().strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        self.assertIn(expected, html)
+        self.assertNotIn("2026-01-01T00:00:00Z", html)
+
+    def test_special_characters_are_escaped(self):
+        nasty = '<script>&"\''
+        rows.insert_rows(self.conn, "订单", [{"单号": nasty, "金额": 1, "状态": "已发货"}])
+        schema.create_table(self.conn, "<script>&", [ColumnSpec("名称", "text")])
+        view_id = views.create_view(self.conn, "订单", nasty, {})
+        self.conn.commit()
+
+        html = self.html(f"/t/订单/?view={view_id}")
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("&#34;", html)
+        self.assertIn("&#39;", html)
+        self.assertIn("&lt;script&gt;&amp;", html)
+
+    def test_table_name_with_slash_is_reachable(self):
+        schema.create_table(self.conn, "报表/日", [ColumnSpec("标题", "text")])
+        rows.insert_rows(self.conn, "报表/日", [{"标题": "日报"}])
+        self.conn.commit()
+        html = self.html("/t/报表/日/")
+        self.assertIn("报表/日", html)
+        self.assertIn("日报", html)
 
 
 class EmptyLibraryTest(unittest.TestCase):
@@ -209,6 +355,11 @@ class EmptyLibraryTest(unittest.TestCase):
         self.assertIn("导入 Excel", html)
         self.assertIn("还没有数据表", html)
         self.assertIn('title="导入向导将在后续版本提供"', html)
+
+    def test_missing_table_in_empty_library_stays_404(self):
+        response = self.client.get("/t/随便/")
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("找不到这张表", response.get_data(as_text=True))
 
 
 if __name__ == "__main__":

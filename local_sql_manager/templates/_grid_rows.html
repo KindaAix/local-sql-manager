@@ -1,6 +1,8 @@
 {% macro cell_text(row, column) -%}
 {%- if column.type == 'checkbox' -%}
 {%- if row.get(column.name) %}是{% endif -%}
+{%- elif column.type == 'local_time' -%}
+{{ row.get(column.name) | local_time }}
 {%- elif row.get(column.name) is none -%}
 {%- else -%}
 {{ row.get(column.name) | cell }}

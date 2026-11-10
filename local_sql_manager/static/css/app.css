@@ -364,3 +364,16 @@ a {
   color: var(--color-text-muted);
   cursor: not-allowed;
 }
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 24px;
+}
+
+.notice-text {
+  margin: 0;
+  color: var(--color-text-weak);
+}

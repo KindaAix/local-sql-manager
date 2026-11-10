@@ -3,17 +3,17 @@
 {% block title %}{% if table %}{{ table }} · {% endif %}本地多维表格管理器{% endblock %}
 
 {% block body %}
-{% if error %}
+{% if not tables and not table %}
 <div class="standalone">
+  {% if error %}
   <h1 class="standalone-title">找不到这张表</h1>
   <p class="standalone-text">{{ error }}</p>
   <a class="button" href="{{ url_for('grid.index') }}">返回首页</a>
-</div>
-{% elif not tables %}
-<div class="standalone">
+  {% else %}
   <h1 class="standalone-title">这个库里还没有数据表</h1>
   <p class="standalone-text">导入一份 Excel，就能开始整理你的数据。</p>
   <button class="button" type="button" disabled title="导入向导将在后续版本提供">导入 Excel</button>
+  {% endif %}
 </div>
 {% else %}
 <div class="app-shell">
@@ -24,21 +24,31 @@
   <div class="main">
     <header class="topbar">
       <div class="topbar-title">
+        {% if table %}
         <span class="topbar-table">{{ table }}</span>
         <span class="topbar-sep">/</span>
         <span class="topbar-view">{{ active_view.name }}</span>
+        {% else %}
+        <span class="topbar-table">找不到这张表</span>
+        {% endif %}
       </div>
       <div class="topbar-actions">
-        {% if not managed %}<span class="badge badge-readonly" title="未登记受管的表只能查看">只读</span>{% endif %}
+        {% if table and not managed %}<span class="badge badge-readonly" title="未登记受管的表只能查看">只读</span>{% endif %}
       </div>
     </header>
 
+    {% if error %}
+    <div class="notice">
+      <p class="notice-text">{{ error }}</p>
+      <a class="button" href="{{ url_for('grid.index') }}">返回首页</a>
+    </div>
+    {% else %}
     <div class="grid-scroll">
       <table class="grid">
         <thead>
           <tr>
             {% for column in columns %}
-            <th class="grid-head">{{ column.name }}</th>
+            <th class="grid-head" scope="col" style="width: {{ column.width }}px">{{ column.name }}</th>
             {% endfor %}
           </tr>
         </thead>
@@ -49,7 +59,7 @@
     </div>
 
     <footer class="pager">
-      <span class="pager-range">第 {{ first_row }}–{{ last_row }} 行 / 共 {{ page.total }} 行</span>
+      <span class="pager-range">{% if page.rows %}第 {{ first_row }}–{{ last_row }} 行 / 共 {{ page.total }} 行{% else %}暂无数据{% endif %}</span>
       <nav class="pager-pages">
         {% if page.page > 1 %}
         <a class="pager-link" href="{{ url_for('grid.table_view', table=table, view=active_view.id, page=page.page - 1, size=size) }}">上一页</a>
@@ -70,6 +80,7 @@
         {% endfor %}
       </nav>
     </footer>
+    {% endif %}
   </div>
 </div>
 {% endif %}
