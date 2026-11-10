@@ -3,7 +3,8 @@ import unittest
 
 from local_sql_manager.services.library import ensure_meta
 from local_sql_manager.services.models import ViewConfig
-from local_sql_manager.services.rows import _has_rowid, get_page
+from local_sql_manager.services.query import page_sql
+from local_sql_manager.services.rows import _has_rowid, _pk_columns, get_page
 from local_sql_manager.services.schema import ColumnSpec, create_table
 from local_sql_manager.services.util import utcnow_iso
 
@@ -163,6 +164,21 @@ class TestGetPage(unittest.TestCase):
         second = get_page(self.conn, "noid3", ViewConfig(), page=2, page_size=2)
         self.assertEqual([row["k"] for row in first.rows], ["a", "b"])
         self.assertEqual([row["k"] for row in second.rows], ["c"])
+
+        # 全表扫描本就是主键序，必须看生成的 SQL 才能证明排序真的加上了。
+        columns = _pk_columns(self.conn, "noid3")
+        self.assertEqual(columns, ["k"])
+        sql, _ = page_sql(
+            "noid3", [], ViewConfig(), 10, 0, soft_delete=False, tiebreaker=columns
+        )
+        self.assertIn('ORDER BY "k" ASC', sql)
+
+    def test_composite_primary_key_columns_are_ordered(self):
+        self.conn.execute(
+            'CREATE TABLE "cpk" ("a" TEXT, "b" TEXT, "v" TEXT, '
+            'PRIMARY KEY ("b", "a")) WITHOUT ROWID'
+        )
+        self.assertEqual(_pk_columns(self.conn, "cpk"), ["b", "a"])
 
     def test_bad_page_falls_back_to_one(self):
         self.insert("完成", 10)
