@@ -12,6 +12,7 @@ dependencies = [
     "flask",
     "openpyxl",
     "fastmcp",
+    "uvicorn",
     "pystray",
     "pillow",
 ]

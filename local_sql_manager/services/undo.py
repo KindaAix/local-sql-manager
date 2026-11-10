@@ -68,7 +68,8 @@ def _txn(conn: sqlite3.Connection):
     name = f"lsm_undo_{next(_SAVEPOINT_SEQ)}"
     started = not conn.in_transaction
     if started:
-        conn.execute("BEGIN")
+        # 与 rows._write_txn 一致：直接拿写锁，避免读后写升级失败。
+        conn.execute("BEGIN IMMEDIATE")
     conn.execute(f'SAVEPOINT "{name}"')
     try:
         yield

@@ -7,8 +7,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import secrets
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 APP_DIR_NAME = "LocalSQLManager"
 DEFAULT_PORT = 8765
@@ -46,6 +50,11 @@ def default_libraries_dir() -> Path:
     return Path.home() / "Documents" / APP_DIR_NAME
 
 
+def new_mcp_token() -> str:
+    """生成 MCP 访问 token；只在本机展示、写进 config.json。"""
+    return secrets.token_urlsafe(24)
+
+
 def default_config() -> dict:
     """首次运行或配置损坏时使用的默认配置。"""
     return {
@@ -53,8 +62,27 @@ def default_config() -> dict:
         "port": DEFAULT_PORT,
         "mcp_port": DEFAULT_MCP_PORT,
         "mcp_read_only": False,
+        "mcp_token": new_mcp_token(),
         "last_library": None,
     }
+
+
+def _save_config(payload: dict) -> None:
+    """把配置写回 config.json（先写临时文件再原子替换），失败不影响启动。"""
+    path = config_path()
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("无法写入配置文件 %s：%s", path, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _port_or_default(value, default: int) -> int:
@@ -90,22 +118,52 @@ def _coerce(key: str, value):
         return _port_or_default(value, default_config()[key])
     if key == "mcp_read_only":
         return _bool_or_default(value)
+    if key == "mcp_token":
+        text = value.strip() if isinstance(value, str) else ""
+        # token 只走 HTTP 头/查询串，非 ASCII 会让比较与展示都出问题，按缺失处理。
+        try:
+            text.encode("ascii")
+        except UnicodeEncodeError:
+            return ""
+        return text
     if key == "last_library":
         return str(value) if value else None
     return str(value)
 
 
 def load_config() -> dict:
-    """读取配置；缺失的键用默认值补齐，未知键丢弃。"""
+    """读取配置；缺失的键用默认值补齐，未知键丢弃。
+
+    MCP token 首次运行时生成并写回 config.json；老配置缺这个键时补上再保存，
+    这样重启后 token 不变，已粘贴到 MCP 客户端的配置继续可用。
+    """
     config = default_config()
     path = config_path()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        _save_config(dict(config))
+        return config
+    except ValueError:
+        # 文件内容解析不了：用默认配置继续跑并覆盖写回，否则每次启动都会
+        # 轮换 token，用户已粘贴到 MCP 客户端的配置会静默失效。
+        logger.warning("配置文件无法解析，已按默认配置重写，MCP token 已轮换")
+        _save_config(dict(config))
+        return config
+    except OSError as exc:
+        # 读不了（权限、被占用）：不覆盖用户文件，但要说明 token 无法保持。
+        logger.warning("无法读取配置文件，MCP token 本次启动会重新生成：%s", exc)
         return config
     if not isinstance(raw, dict):
+        logger.warning("配置文件不是对象，已按默认配置重写，MCP token 已轮换")
+        _save_config(dict(config))
         return config
     for key in config:
         if key in raw:
             config[key] = _coerce(key, raw[key])
+    if not config["mcp_token"]:
+        config["mcp_token"] = new_mcp_token()
+    if raw.get("mcp_token") != config["mcp_token"]:
+        raw["mcp_token"] = config["mcp_token"]
+        _save_config(raw)
     return config
