@@ -40,6 +40,7 @@
 
 按依赖切成 8 层，层内并行、层间串行；每层合并后打 tag，下一层从 tag 拉 worktree。
 
+
 ```
 层 0（已完成）  1 骨架 → 2 模型 → 3 库 → 4 类型                    tag contracts-v1
 层 1（4 并行）  A 5 建表 → 6 查询 → 7 分页   B 9 审计   C 23 桌面壳   D 17 lsmf
@@ -49,6 +50,7 @@
 层 5（3 并行）  A 18 合并   B 19 网格页   C 22 MCP
 层 6（2 并行）  A 20 写入 API + JS   B 21 导入/导出/分享/视图/历史页
 层 7（串行）    24 打包 → 25 清理
+
 ```
 
 **分层依据（同层文件必须互斥）**
@@ -78,6 +80,7 @@
 
 **Worktree 机制**
 
+
 ```bash
 # 每层开工时，每个成员一条独立分支与工作树
 git worktree add .worktrees/L1a -b layer1/t5-7 contracts-v1
@@ -87,6 +90,7 @@ cd .worktrees/L1a && D:/Projects/local-sql-manager/.venv/Scripts/python.exe -m u
 # 合并（按依赖顺序，冲突由集成人解）
 git merge --no-ff layer1/t5-7 && git tag layer-1
 rm -rf .worktrees/L1a && git worktree prune
+
 ```
 
 - `.worktrees/` 加入 `.gitignore`，不提交。
@@ -128,17 +132,20 @@ rm -rf .worktrees/L1a && git worktree prune
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 # tests/test_app_factory.py
 import unittest
 from local_sql_manager.app import create_app
 
 class TestAppFactory(unittest.TestCase):
-    def test_healthz(self):
+    
+def test_healthz(self):
         client = create_app().test_client()
         r = client.get("/healthz")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_data(as_text=True), "ok")
+
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -155,9 +162,11 @@ Run: `python -m unittest tests.test_app_factory -v` — 期望 PASS。
 
 - [ ] **Step 5: 提交**
 
+
 ```bash
 git add pyproject.toml local_sql_manager tests
 git commit -m "feat: 新建 local_sql_manager 包与健康检查"
+
 ```
 
 ### Task 2: 数据模型与时间工具
@@ -170,16 +179,20 @@ git commit -m "feat: 新建 local_sql_manager 包与健康检查"
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 class TestUtil(unittest.TestCase):
-    def test_utcnow_format(self):
+    
+def test_utcnow_format(self):
         self.assertRegex(utcnow_iso(), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 class TestViewConfig(unittest.TestCase):
-    def test_defaults_are_independent(self):
+    
+def test_defaults_are_independent(self):
         a, b = ViewConfig(), ViewConfig()
         a.filters.append({"column": "x"})
         self.assertEqual(b.filters, [])
+
 ```
 
 - [ ] **Step 2: 运行确认失败** — `python -m unittest tests.test_models -v`。
@@ -200,6 +213,7 @@ class TestViewConfig(unittest.TestCase):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_creates_meta_tables(tmp_db):
     lib = open_library(tmp_db)
@@ -211,6 +225,7 @@ def test_rejects_newer_format(tmp_db):
     open_library(tmp_db).conn.execute("UPDATE __lsm_meta SET value='9' WHERE key='version'")
     with self.assertRaises(UnsupportedFormat):
         open_library(tmp_db)
+
 ```
 
 - [ ] **Step 2: 运行确认失败** — `python -m unittest tests.test_library -v`。
@@ -231,6 +246,7 @@ def test_rejects_newer_format(tmp_db):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_leading_zero_is_text(self):
     self.assertEqual(infer_type(["00123", "00456"]), ("text", False))
@@ -245,6 +261,7 @@ def test_dates_and_checkbox(self):
 
 def test_cast_expr(self):
     self.assertEqual(cast_expr("金额", "number"), 'CAST("金额" AS REAL)')
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -266,6 +283,7 @@ def test_cast_expr(self):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_create_table_adds_aux_columns(conn):
     create_table(conn, "订单", [ColumnSpec("金额", "number")])
@@ -283,6 +301,7 @@ def test_creates_index_per_business_column(conn):
     create_table(conn, "订单", [ColumnSpec("金额", "number")])
     idx = [r[0] for r in conn.execute('PRAGMA index_list("订单")')]
     self.assertIn("__lsm_idx_订单_金额", idx)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -303,6 +322,7 @@ def test_creates_index_per_business_column(conn):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_text_filter_uses_param(self):
     sql, params = build_where([{"column": "客户", "op": "contains", "value": "云栖"}],
@@ -317,6 +337,7 @@ def test_number_filter_casts(self):
 
 def test_unknown_column_ignored(self):
     self.assertEqual(build_where([{"column": "不存在", "op": "eq", "value": 1}], []), ("", []))
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -338,6 +359,7 @@ def test_unknown_column_ignored(self):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_excludes_soft_deleted_and_paginates(seeded):
     conn = seeded  # 3 行，其中 1 行 deleted_at 非空
@@ -350,6 +372,7 @@ def test_group_counts_whole_filter_set(seeded):
     page = get_page(seeded_6_rows, "订单", view, page=1, page_size=2)
     counts = {g.key: g.count for g in page.groups}
     self.assertEqual(counts["完成"], 4)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -371,6 +394,7 @@ def test_group_counts_whole_filter_set(seeded):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_update_bumps_updated_at_and_records_op(conn, seeded):
     op = update_cells(conn, "订单", {1: {"金额": 99}}, {1: seeded_updated_at(conn, 1)})
@@ -385,6 +409,7 @@ def test_stale_updated_at_conflicts(conn, seeded):
 def test_soft_delete_is_invisible_to_page(conn, seeded):
     soft_delete(conn, "订单", [1])
     self.assertEqual(get_page(conn, "订单", ViewConfig()).total, len(seeded) - 1)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -405,6 +430,7 @@ def test_soft_delete_is_invisible_to_page(conn, seeded):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_record_and_history(conn):
     op = record(conn, "update", "订单", "web", {"rows": []})
@@ -414,6 +440,7 @@ def test_record_and_history(conn):
 def test_soft_delete_flag_survives(conn):
     op = record(conn, "purge", "订单", "mcp", {}, irreversible=True)
     self.assertEqual(get_op(conn, op)["irreversible"], 1)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -435,6 +462,7 @@ def test_soft_delete_flag_survives(conn):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_undo_update_restores_previous_value(conn, seeded):
     op = update_cells(conn, "订单", {1: {"金额": 500}}, {1: updated_at(conn, 1)})
@@ -451,6 +479,7 @@ def test_purge_is_irreversible(conn):
     op = record(conn, "purge", "订单", "web", {}, irreversible=True)
     with self.assertRaises(Irreversible):
         undo(conn, op)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -471,6 +500,7 @@ def test_purge_is_irreversible(conn):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_creating_table_makes_default_view(conn):
     create_table(conn, "订单", [ColumnSpec("金额", "number")])
@@ -485,6 +515,7 @@ def test_default_view_cannot_be_deleted(conn, table_with_default):
 def test_update_prunes_unknown_columns(conn, table_with_default):
     update_view(conn, table_with_default, ViewConfig(hidden=["不存在", "金额"]))
     self.assertEqual(load_config(conn, table_with_default).hidden, ["金额"])
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -505,6 +536,7 @@ def test_update_prunes_unknown_columns(conn, table_with_default):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_add_field_is_empty_for_existing_rows(conn, seeded):
     add_field(conn, "订单", ColumnSpec("备注", "text"))
@@ -519,6 +551,7 @@ def test_drop_field_backs_up_values_and_undo_restores(conn, seeded):
     op = drop_field(conn, "订单", "金额")
     undo(conn, op)
     self.assertEqual(conn.execute('SELECT "金额" FROM "订单" WHERE id=1').fetchone()[0], 100)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -539,6 +572,7 @@ def test_drop_field_backs_up_values_and_undo_restores(conn, seeded):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_drop_renames_into_trash(conn, seeded):
     drop_table(conn, "订单")
@@ -550,6 +584,7 @@ def test_restore_avoids_name_clash(conn, seeded):
     create_table(conn, "订单", [ColumnSpec("金额", "number")])
     restore_table(conn, "订单")
     self.assertIn("订单_2", list_tables(conn))
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -569,6 +604,7 @@ def test_restore_avoids_name_clash(conn, seeded):
 - Produces: `check_adoptable(conn, table) -> tuple[bool, str]`；`adopt_table(conn, table) -> int`。
 
 - [ ] **Step 1: 写失败测试**
+
 
 ```python
 def test_no_pk_gets_new_id(conn):
@@ -604,6 +640,7 @@ def test_restore_conflicting_unique_raises(conn):
     conn.execute('INSERT INTO u (code) VALUES (\'x\')')
     with self.assertRaises(Exception):
         restore_rows(conn, "u", [rid])
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -623,6 +660,7 @@ def test_restore_conflicting_unique_raises(conn):
 - Produces: `SheetPreview(name, columns, row_count, sample, types, suspicious, empty)`；`parse_workbook(path) -> list[SheetPreview]`；`import_sheets(conn, path, selected: list[str], types: dict[str, dict[str, str]], on_conflict: str) -> list[str]`，`on_conflict ∈ {"overwrite","copy","skip"}`。
 
 - [ ] **Step 1: 写失败测试**（fixture 用 openpyxl 生成：一个 3 sheet 工作簿，含空 sheet、混合类型列、前导零列、重复列名）
+
 
 ```python
 def test_preview_marks_empty_and_types(tmp_xlsx):
@@ -648,6 +686,7 @@ def test_failure_rolls_back_everything(conn, tmp_xlsx_bad):
     with self.assertRaises(Exception):
         import_sheets(conn, tmp_xlsx_bad, ["订单", "客户"], {}, "skip")
     self.assertEqual(list_tables(conn), [])
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -668,6 +707,7 @@ def test_failure_rolls_back_everything(conn, tmp_xlsx_bad):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_view_export_respects_filter_and_hidden(conn, seeded):
     view = ViewConfig(filters=[{"column": "状态", "op": "eq", "value": "完成"}], hidden=["备注"])
@@ -680,6 +720,7 @@ def test_view_export_respects_filter_and_hidden(conn, seeded):
 def test_multi_table_workbook(conn, two_tables):
     path = export_workbook(conn, ["订单", "客户"], tmp_path / "all.xlsx")
     self.assertEqual(openpyxl.load_workbook(path).sheetnames, ["订单", "客户"])
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -699,6 +740,7 @@ def test_multi_table_workbook(conn, two_tables):
 - Produces: `export_lsmf(conn, db_path, out_path, app_version) -> Path`；`import_lsmf(path, libraries_dir) -> Path`。
 
 - [ ] **Step 1: 写失败测试**
+
 
 ```python
 def test_round_trip(conn, lib_path, tmp_path):
@@ -722,6 +764,7 @@ def test_rejects_newer_manifest(tmp_path):
 def test_rejects_zip_bomb(tmp_path):
     with self.assertRaises(ShareError):
         import_lsmf(make_lsmf(tmp_path, fill_mb=600), tmp_path)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -742,6 +785,7 @@ def test_rejects_zip_bomb(tmp_path):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_aligns_columns_case_insensitively(conn, two_similar):
     plan = plan_merge(conn, ["一月", "二月"], "合计")
@@ -752,6 +796,7 @@ def test_missing_columns_become_null(conn, two_similar):
     total = conn.execute('SELECT COUNT(*) FROM "合计"').fetchone()[0]
     self.assertEqual(total, 4)
     self.assertIsNone(conn.execute('SELECT "备注" FROM "合计" WHERE "备注" IS NOT NULL LIMIT 1').fetchone())
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -774,6 +819,7 @@ def test_missing_columns_become_null(conn, two_similar):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_root_redirects_to_first_table(client_with_data):
     r = client_with_data.get("/")
@@ -788,6 +834,7 @@ def test_grid_renders_rows_and_sidebar(client_with_data):
 def test_grid_hides_deleted_rows(client_with_data):
     html = client_with_data.get("/t/订单/").get_data(as_text=True)
     self.assertNotIn("已删除的订单号", html)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -809,6 +856,7 @@ def test_grid_hides_deleted_rows(client_with_data):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_save_returns_row_fragment(client_with_data):
     row = client_with_data.get("/t/订单/").get_data(as_text=True)
@@ -828,6 +876,7 @@ def test_delete_then_undo(client_with_data):
     op = r.get_json()["op"]
     client_with_data.post(f"/api/undo/{op}")
     self.assertIn("SO-2026-0148", client_with_data.get("/t/订单/").get_data(as_text=True))
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -851,6 +900,7 @@ def test_delete_then_undo(client_with_data):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_import_preview_lists_sheets(client, tmp_xlsx):
     data = {"file": (open(tmp_xlsx, "rb"), "book.xlsx")}
@@ -866,6 +916,7 @@ def test_create_view_persists_config(client_with_data):
 def test_trash_lists_soft_deleted(client_with_data):
     client_with_data.post("/api/t/订单/delete", json={"ids": [1]})
     self.assertIn("SO-2026-0148", client_with_data.get("/trash").get_data(as_text=True))
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -887,6 +938,7 @@ def test_trash_lists_soft_deleted(client_with_data):
 
 - [ ] **Step 1: 写失败测试**（直接调用工具函数，不经 HTTP）
 
+
 ```python
 def test_update_rows_writes_audit(lib):
     mcp = build_mcp(lib)
@@ -898,6 +950,7 @@ def test_read_only_blocks_writes(lib):
     tools = as_functions(build_mcp(lib, read_only=True))
     with self.assertRaises(PermissionError):
         tools["delete_rows"](table="订单", ids=[1])
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -919,6 +972,7 @@ def test_read_only_blocks_writes(lib):
 
 - [ ] **Step 1: 写失败测试**
 
+
 ```python
 def test_second_instance_refused(self):
     self.assertTrue(acquire_single_instance("lsm-test"))
@@ -929,6 +983,7 @@ def test_pick_port_skips_busy(self):
         s.bind(("127.0.0.1", 0)); s.listen()
         busy = s.getsockname()[1]
         self.assertNotEqual(pick_port(busy), busy)
+
 ```
 
 - [ ] **Step 2: 运行确认失败**。
@@ -957,7 +1012,11 @@ Run: `powershell -File packaging/build.ps1` — 期望产出 `build/local_sql_ma
 
 Run: `(Get-ChildItem build/installer/*.exe).Length / 1MB` — 期望 ≤ 100；双击安装包 → 闪屏出现 → 浏览器打开 → 托盘出现 → 退出干净。
 
-- [ ] **Step 4: 提交** — `git commit -m "build: Nuitka 与 Inno Setup 打包脚本"`。
+- [ ] **Step 4: 校验 wheel 数据文件**
+
+Run: `python -m build --wheel && python -c "import zipfile,glob; z=zipfile.ZipFile(glob.glob('dist/*.whl')[0]); print([n for n in z.namelist() if 'templates' in n or 'static' in n][:5])"` — 期望输出里有模板与静态文件；缺失说明 pyproject 的数据文件声明未覆盖，回到 `pyproject.toml` 修 glob，再重跑本步。
+
+- [ ] **Step 5: 提交** — `git commit -m "build: Nuitka 与 Inno Setup 打包脚本"`。
 
 ### Task 25: 清理旧代码与文档
 
