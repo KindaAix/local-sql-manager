@@ -192,7 +192,7 @@ def main() -> int:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         library = open_library(path)
 
-        app: Flask = create_app()
+        app: Flask = create_app(library)
         port = pick_port(config["port"])
         server = make_server(HOST, port, app, threaded=True)
         web_thread = threading.Thread(

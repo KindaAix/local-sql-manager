@@ -1,0 +1,24 @@
+<div class="sidebar-section">
+  <div class="sidebar-heading">数据表</div>
+  <nav class="nav-list">
+    {% for name in tables %}
+    <a class="nav-item{% if name == table %} is-active{% endif %}" href="{{ url_for('grid.table_view', table=name) }}">{{ name }}</a>
+    {% endfor %}
+  </nav>
+</div>
+
+{% if table %}
+<div class="sidebar-section">
+  <div class="sidebar-heading">视图</div>
+  <nav class="nav-list">
+    {% for item in views %}
+    <a class="nav-item nav-sub{% if item.id == active_view.id %} is-active{% endif %}" href="{{ url_for('grid.table_view', table=table, view=item.id) }}">{{ item.name }}</a>
+    {% endfor %}
+  </nav>
+</div>
+{% endif %}
+
+<div class="sidebar-section sidebar-foot">
+  <span class="nav-item is-disabled" aria-disabled="true" title="操作历史将在后续版本提供">操作历史</span>
+  <span class="nav-item is-disabled" aria-disabled="true" title="回收站将在后续版本提供">回收站</span>
+</div>

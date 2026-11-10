@@ -1,0 +1,36 @@
+{% macro cell_text(row, column) -%}
+{%- if column.type == 'checkbox' -%}
+{%- if row.get(column.name) %}是{% endif -%}
+{%- elif row.get(column.name) is none -%}
+{%- else -%}
+{{ row.get(column.name) | cell }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro grid_row(row) -%}
+<tr class="grid-row">
+  {% for column in columns %}
+  <td class="cell">{{ cell_text(row, column) }}</td>
+  {% endfor %}
+</tr>
+{%- endmacro %}
+
+{% if grouped %}
+  {% for block in blocks %}
+  <tr class="group-row">
+    <td class="group-cell" colspan="{{ columns | length }}">
+      <span class="group-key">{{ block.label }}</span>
+      <span class="group-count">共 {{ block.count }} 条</span>
+      {%- if block.continued %}<span class="group-continued">（续）</span>{% endif %}
+      {%- for item in block.aggregates %}<span class="group-agg">{{ item.label }}：{% if item.value is none %}—{% else %}{{ item.value | cell }}{% endif %}</span>{% endfor %}
+    </td>
+  </tr>
+  {% for row in block.rows %}{{ grid_row(row) }}{% endfor %}
+  {% endfor %}
+{% elif page.rows %}
+  {% for row in page.rows %}{{ grid_row(row) }}{% endfor %}
+{% else %}
+  <tr class="empty-row">
+    <td class="empty-cell" colspan="{{ columns | length }}">还没有数据</td>
+  </tr>
+{% endif %}
