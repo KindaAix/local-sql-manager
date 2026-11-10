@@ -57,14 +57,39 @@ def default_config() -> dict:
     }
 
 
+def _port_or_default(value, default: int) -> int:
+    """端口必须是 0..65535 的整数，否则回退默认值。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return default
+    if 0 <= port <= 65535:
+        return port
+    return default
+
+
+def _bool_or_default(value, default: bool = False) -> bool:
+    """宽松解析布尔配置，避免字符串 "false" 被当成 True。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off", ""):
+            return False
+    return default
+
+
 def _coerce(key: str, value):
     if key in ("port", "mcp_port"):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default_config()[key]
+        return _port_or_default(value, default_config()[key])
     if key == "mcp_read_only":
-        return bool(value)
+        return _bool_or_default(value)
     if key == "last_library":
         return str(value) if value else None
     return str(value)

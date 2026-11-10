@@ -96,7 +96,16 @@ def release_single_instance(name: str) -> None:
 
 
 def pick_port(preferred: int) -> int:
-    """优先使用 preferred；被占用时让系统分配一个空闲端口。"""
+    """优先使用 preferred；被占用或越界时让系统分配一个空闲端口。"""
+    if isinstance(preferred, bool):
+        preferred = 0
+    else:
+        try:
+            preferred = int(preferred)
+        except (TypeError, ValueError):
+            preferred = 0
+    if not 0 <= preferred <= 65535:
+        preferred = 0
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         try:
             probe.bind((HOST, preferred))
@@ -162,7 +171,12 @@ def _show_error(message: str) -> None:
 
 def main() -> int:
     if not acquire_single_instance(APP_MUTEX):
-        print("本地多维表格管理器已在运行，请从系统托盘打开界面。")
+        port = load_config()["port"]
+        _show_error(
+            "本地多维表格管理器已在运行。\n"
+            "请从系统托盘打开界面，或访问 "
+            f"http://{HOST}:{port}/"
+        )
         return 1
 
     library = None
@@ -179,7 +193,7 @@ def main() -> int:
         library = open_library(path)
 
         app: Flask = create_app()
-        port = pick_port(int(config["port"]))
+        port = pick_port(config["port"])
         server = make_server(HOST, port, app, threaded=True)
         web_thread = threading.Thread(
             target=server.serve_forever, name="lsm-web", daemon=True
@@ -193,6 +207,7 @@ def main() -> int:
             port=int(config["mcp_port"]),
             read_only=bool(config["mcp_read_only"]),
         )
+        mcp_config = mcp_config_text if mcp is not None else None
         open_browser(url)
 
         def shutdown() -> None:
@@ -206,7 +221,7 @@ def main() -> int:
                 data_dir=data_dir(),
                 log_dir=log_dir(),
                 on_quit=shutdown,
-                mcp_config=mcp_config_text,
+                mcp_config=mcp_config,
             )
         except ImportError:
             logger.warning("未安装 pystray，改为前台运行，按 Ctrl+C 退出")

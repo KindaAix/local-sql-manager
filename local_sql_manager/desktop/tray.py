@@ -122,6 +122,7 @@ def create_icon(
             logger.exception("生成 MCP 配置失败")
             return
         if not text:
+            logger.warning("MCP 服务未启动，配置不可复制")
             return
         if not _set_clipboard_text(text):
             logger.warning("剪贴板不可用，MCP 配置未复制")
