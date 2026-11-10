@@ -217,13 +217,14 @@ def _clear_metadata(conn: sqlite3.Connection, table: str) -> None:
 _LEGACY_RENAME_HINTS = ("error in view", "error in trigger", "no such table")
 
 
-def _sql_references_table(sql: str, table: str) -> bool:
-    """SQL 中是否引用了 table（大小写不敏感，支持引号标识符）。
+def _count_table_references(sql: str, table: str) -> int:
+    """统计 SQL 中 table 的出现次数（大小写不敏感，支持引号标识符）。
 
     只跳过字符串字面量与注释，其余按「出现即算引用」处理：列名与表名同名
     时会多报，但不会漏掉真正的 view/trigger 引用。
     """
     target = table.lower()
+    count = 0
     index = 0
     length = len(sql)
     while index < length:
@@ -268,7 +269,7 @@ def _sql_references_table(sql: str, table: str) -> bool:
                 index += 1
             parts.append(sql[start:index])
             if "".join(parts).lower() == target:
-                return True
+                count += 1
             index += 1
             continue
         if char.isalnum() or char == "_" or ord(char) > 127:
@@ -280,25 +281,37 @@ def _sql_references_table(sql: str, table: str) -> bool:
             ):
                 index += 1
             if sql[start:index].lower() == target:
-                return True
+                count += 1
             continue
         index += 1
-    return False
+    return count
+
+
+def _sql_references_table(sql: str, table: str) -> bool:
+    return _count_table_references(sql, table) > 0
 
 
 def _referencing_objects(
     conn: sqlite3.Connection, table: str
 ) -> list[str]:
-    """返回 SQL 里引用 table 的视图与「挂在其它表上」的触发器名。"""
+    """返回 legacy 改名后会悬挂在旧表名上的 view / trigger 名。
+
+    挂在本表上的 trigger，ON 子句本身就会出现一次表名；若出现次数 > 1，
+    说明触发器体/WHEN 里又引用了本表，legacy RENAME 不会改写触发器体，
+    必须计入；恰好 1 次视为只挂在自身上，可安全回退。
+    """
     names: list[str] = []
     for row in conn.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master"
         " WHERE sql IS NOT NULL AND type IN ('view', 'trigger')"
     ):
         kind, name, tbl_name, sql = row[0], row[1], row[2], row[3]
+        count = _count_table_references(sql, table)
         if kind == "trigger" and str(tbl_name).lower() == table.lower():
+            if count > 1:
+                names.append(name)
             continue
-        if _sql_references_table(sql, table):
+        if count > 0:
             names.append(name)
     return names
 

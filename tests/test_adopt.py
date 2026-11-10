@@ -694,10 +694,16 @@ class TestReviewFixes(BaseAdoptTestCase):
         self.assertIn("TEXT", reason)
 
     def test_reason_mentions_collation_loss(self):
-        self.execute("CREATE TABLE l (v TEXT)")
+        self.execute("CREATE TABLE l (v TEXT COLLATE NOCASE)")
         ok, reason = check_adoptable(self.conn, "l")
         self.assertTrue(ok)
         self.assertIn("COLLATE", reason)
+
+    def test_reason_omits_collation_when_absent(self):
+        self.execute("CREATE TABLE p (v TEXT)")
+        ok, reason = check_adoptable(self.conn, "p")
+        self.assertTrue(ok)
+        self.assertNotIn("COLLATE", reason)
 
     def test_rename_with_reference_and_broken_view_is_rejected(self):
         self.execute("CREATE TABLE t (a TEXT)")
@@ -723,6 +729,34 @@ class TestReviewFixes(BaseAdoptTestCase):
         self.assertEqual(self.execute("SELECT a FROM v").fetchone()[0], "x")
         self.assertIn("t2", self.object_sql("v"))
         self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 1)
+
+    def test_self_referencing_trigger_and_broken_view_is_rejected(self):
+        self.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        self.execute(
+            "CREATE TRIGGER t_self AFTER INSERT ON t"
+            " BEGIN UPDATE t SET a = 'x' WHERE id = new.id; END"
+        )
+        self.execute("CREATE VIEW broken AS SELECT * FROM nope")
+        with self.assertRaises(ValueError) as ctx:
+            rename_table(self.conn, "t", "t2")
+        self.assertIn("引用", str(ctx.exception))
+        self.assertIn("t", list_tables(self.conn))
+        self.assertNotIn("t2", list_tables(self.conn))
+        self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 0)
+
+    def test_self_referencing_trigger_is_rewritten_on_modern_path(self):
+        self.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        self.execute(
+            "CREATE TRIGGER t_self AFTER INSERT ON t"
+            " BEGIN UPDATE t SET a = 'x' WHERE id = new.id; END"
+        )
+        rename_table(self.conn, "t", "t2")
+        sql = self.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 't_self'"
+        ).fetchone()[0]
+        self.assertIn("t2", sql)
+        self.execute("INSERT INTO t2 (a) VALUES ('a')")
+        self.assertEqual(self.execute("SELECT a FROM t2").fetchone()[0], "x")
 
     def test_sql_reference_detection_rules(self):
         self.assertFalse(

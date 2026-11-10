@@ -516,7 +516,8 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
         parts.append(
             "原表 UNIQUE 的 ON CONFLICT 策略无法用唯一索引表达，重建后冲突处理回到默认"
         )
-    parts.append("列级 COLLATE 不会保留，比较与排序将按默认规则")
+    if create_sql and re.search(r"\bCOLLATE\b", create_sql, re.I):
+        parts.append("列级 COLLATE 不会保留，比较与排序将按默认规则")
 
     checks = _check_constraints(create_sql)
     if renamed_pk:
