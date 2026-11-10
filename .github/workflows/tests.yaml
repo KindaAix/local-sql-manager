@@ -7,7 +7,9 @@ on:
 jobs:
   tests:
     name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    # 这是 Windows 桌面应用：托盘、互斥体、路径与文件占用语义都按 Windows 验证，
+    # 在 Linux runner 上跑会得到与产品无关的失败。
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
