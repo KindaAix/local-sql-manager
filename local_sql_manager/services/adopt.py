@@ -20,7 +20,7 @@ from typing import Any
 
 from . import audit
 from .models import AdoptError
-from .schema import DEFAULT_FIELD_WIDTH, ensure_indexes
+from .schema import DEFAULT_FIELD_WIDTH, _rename_table_strict, ensure_indexes
 from .types import infer_type
 from .util import utcnow_iso
 
@@ -720,22 +720,6 @@ def _payload(plan: _Plan) -> dict:
     }
 
 
-def _rename_table(conn: sqlite3.Connection, old: str, new: str) -> None:
-    """在 legacy_alter_table 下改表名，避免 RENAME 重解析整个 schema。
-
-    SQLite 3.25+ 的 ALTER TABLE RENAME 会重新解析库内所有对象；只要存在
-    引用旧表的 view/触发器，或一个无关的坏视图，RENAME 就会抛英文错误。
-    legacy 模式只改 schema 文本、不重写引用；这里改的是无人引用的临时表，
-    视图/触发器里的原名保持不变，改完仍指向最终表名。
-    """
-    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
-    conn.execute("PRAGMA legacy_alter_table=ON")
-    try:
-        conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
-    finally:
-        conn.execute(f"PRAGMA legacy_alter_table={1 if legacy else 0}")
-
-
 def _rebuild(conn: sqlite3.Connection, plan: _Plan) -> None:
     old = plan.table
     definitions, insert_columns, select_expressions, params = _build_columns(plan)
@@ -762,7 +746,9 @@ def _rebuild(conn: sqlite3.Connection, plan: _Plan) -> None:
         raise AdoptError(f"重建前后行数不一致（{plan.row_count} → {copied}），已取消")
 
     conn.execute(f"DROP TABLE {_quote(old)}")
-    _rename_table(conn, TEMP_TABLE, old)
+    # 临时表无人引用，正常走 modern；若库里有坏视图挡住重解析，
+    # schema._rename_table_strict 会自动回退 legacy。
+    _rename_table_strict(conn, TEMP_TABLE, old)
 
     _create_indexes(conn, plan)
     _recreate_triggers(conn, plan)

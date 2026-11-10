@@ -530,8 +530,17 @@ class TestReviewFixes(BaseAdoptTestCase):
     def test_rename_helper_restores_legacy_pragma_on_failure(self):
         self.execute("PRAGMA legacy_alter_table=1")
         with self.assertRaises(sqlite3.OperationalError):
-            adopt_service._rename_table(self.conn, "不存在", "x")
+            adopt_service._rename_table_strict(self.conn, "不存在", "x")
         self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 1)
+
+    def test_schema_rename_updates_view_reference(self):
+        self.execute("CREATE TABLE t (a TEXT)")
+        self.execute("CREATE VIEW v AS SELECT a FROM t")
+        self.execute("INSERT INTO t (a) VALUES ('x')")
+        rename_table(self.conn, "t", "t2")
+        self.assertEqual(self.execute("SELECT a FROM v").fetchone()[0], "x")
+        self.assertIn("t2", self.object_sql("v"))
+        self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 0)
 
     def test_schema_rename_works_with_broken_view(self):
         self.execute("CREATE TABLE t (a TEXT)")

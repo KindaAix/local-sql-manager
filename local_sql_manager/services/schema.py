@@ -212,6 +212,33 @@ def _clear_metadata(conn: sqlite3.Connection, table: str) -> None:
         conn.execute(f'DELETE FROM "{meta}" WHERE "table_name" = ?', (table,))
 
 
+# 这些错误说明 RENAME 重解析 schema 时被失效的视图/触发器挡住，可以退回
+# legacy 模式重试；其它 OperationalError 原样抛出。
+_LEGACY_RENAME_HINTS = ("error in view", "error in trigger", "no such table")
+
+
+def _rename_table_strict(conn: sqlite3.Connection, old: str, new: str) -> None:
+    """优先用 modern 语义改表名（视图/触发器引用跟随新名），必要时回退 legacy。
+
+    SQLite 3.25+ 的 RENAME 会重解析整个 schema：库里只要存在引用不存在对象
+    的坏视图/触发器，连无关表的改名也会失败。这种情况下退回 legacy 模式——
+    它只改 schema 文本、不重写引用，适合「改名无人引用的临时表」或「坏视图
+    挡住无关改名」。两种路径都在 finally 中把 PRAGMA 恢复成原值。
+    """
+    try:
+        conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+        return
+    except sqlite3.OperationalError as exc:
+        if not any(hint in str(exc).lower() for hint in _LEGACY_RENAME_HINTS):
+            raise
+    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table={1 if legacy else 0}")
+
+
 def _relocate_table(conn: sqlite3.Connection, old: str, new: str) -> None:
     """把表 old 改名为 new，字段/视图元数据与自动索引一并跟随。
 
@@ -227,15 +254,7 @@ def _relocate_table(conn: sqlite3.Connection, old: str, new: str) -> None:
         )
         if row[0].startswith(_index_prefix(old))
     ]
-    # SQLite 3.25+ 的 RENAME 会重解析整个 schema；库里存在坏视图或引用旧表
-    # 的触发器时，即使与本次改名无关也会整条失败。legacy 模式只改 schema
-    # 文本、不重写引用，避免让一个坏视图挡住重命名/删表/恢复。
-    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
-    conn.execute("PRAGMA legacy_alter_table=ON")
-    try:
-        conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
-    finally:
-        conn.execute(f"PRAGMA legacy_alter_table={1 if legacy else 0}")
+    _rename_table_strict(conn, old, new)
     _clear_metadata(conn, new)
     for meta in ("__lsm_table", "__lsm_field", "__lsm_view"):
         conn.execute(
