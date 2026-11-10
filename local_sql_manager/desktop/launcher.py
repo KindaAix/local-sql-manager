@@ -239,6 +239,18 @@ def _stop_component(component) -> None:
             return
 
 
+def checkpoint_library(library: Library) -> None:
+    """退出前把 WAL 里的页并回主库。
+
+    开了 WAL 之后，运行期间数据可能还在 -wal 里；用户直接复制 lib.sqlite 备份
+    会拿到不完整副本（只剩表结构）。TRUNCATE 把 -wal 清空，失败不影响退出。
+    """
+    try:
+        library.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as exc:  # noqa: BLE001 - 退出路径不能因为 checkpoint 失败中断
+        logger.warning("退出前 WAL checkpoint 失败，-wal 文件保留：%s", exc)
+
+
 def _show_error(message: str) -> None:
     """启动失败时弹原生对话框；无界面环境退回 stderr。"""
     if os.name == "nt":
@@ -331,6 +343,8 @@ def main() -> int:
         if web_thread is not None:
             web_thread.join(timeout=5)
         if library is not None:
+            # 先 checkpoint 再关连接：应用活着时只拷 .sqlite 也能拿到完整数据。
+            checkpoint_library(library)
             try:
                 library.conn.close()
             except Exception:

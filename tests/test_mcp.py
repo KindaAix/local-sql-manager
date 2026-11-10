@@ -262,15 +262,18 @@ class McpToolCase(unittest.TestCase):
 
     def test_count_rows_rejects_invalid_filters(self):
         cases = [
-            ("未知列", [{"column": "不存在", "op": "eq", "value": 1}]),
-            ("错误操作符", [{"column": "金额", "op": "contains", "value": 1}]),
-            ("非对象", ["金额 > 1"]),
+            ("未知列", [{"column": "不存在", "op": "eq", "value": 1}], "筛选条件不支持"),
+            ("错误操作符", [{"column": "金额", "op": "contains", "value": 1}], "筛选条件不支持"),
+            ("非对象", ["金额 > 1"], "筛选条件不支持"),
+            ("缺少取值", [{"column": "金额", "op": "gt"}], "筛选条件缺少取值"),
+            ("空取值", [{"column": "金额", "op": "gt", "value": None}], "筛选条件缺少取值"),
+            ("空白取值", [{"column": "备注", "op": "contains", "value": "  "}], "筛选条件缺少取值"),
         ]
-        for label, filters in cases:
+        for label, filters, expected in cases:
             with self.subTest(label=label):
                 with self.assertRaises(ValueError) as caught:
                     self.tools["count_rows"](table="订单", filters=filters)
-                self.assertIn("筛选条件不支持", str(caught.exception))
+                self.assertIn(expected, str(caught.exception))
         with self.assertRaises(ValueError) as caught:
             self.tools["count_rows"](table="订单", filters={"column": "金额"})
         self.assertIn("filters", str(caught.exception))
@@ -461,6 +464,8 @@ class McpToolCase(unittest.TestCase):
         self.assertEqual(mcp.lsm_token, "tok")
         self.assertIsInstance(make_http_app(mcp), TokenAuthMiddleware)
         self.assertIsNotNone(make_http_app(build_mcp(self.lib)))
+        # 空 token 也是「配了 token」，必须套中间件一律 401，不能 fail-open。
+        self.assertIsInstance(make_http_app(build_mcp(self.lib, token="")), TokenAuthMiddleware)
 
     def test_tool_calls_close_their_connections(self):
         opened = []
@@ -484,7 +489,7 @@ class McpToolCase(unittest.TestCase):
 class TokenAuthCase(unittest.TestCase):
     TOKEN = "test-token-123"
 
-    def _call(self, app, headers=None, query=b""):
+    def _run(self, app, scope):
         events = []
 
         async def receive():
@@ -493,6 +498,10 @@ class TokenAuthCase(unittest.TestCase):
         async def send(message):
             events.append(message)
 
+        asyncio.run(app(scope, receive, send))
+        return events
+
+    def _call(self, app, headers=None, query=b""):
         scope = {
             "type": "http",
             "asgi": {"version": "3.0"},
@@ -506,8 +515,7 @@ class TokenAuthCase(unittest.TestCase):
             "server": ("127.0.0.1", 8766),
             "client": ("127.0.0.1", 50000),
         }
-        asyncio.run(app(scope, receive, send))
-        return events
+        return self._run(app, scope)
 
     def test_missing_or_wrong_token_is_rejected(self):
         for headers, query in (
@@ -543,6 +551,37 @@ class TokenAuthCase(unittest.TestCase):
         )
         self.assertTrue(inner.called)
         self.assertEqual(events[0]["status"], 200)
+
+    def test_non_ascii_token_is_401_not_crash(self):
+        # compare_digest 的 str 版本遇非 ASCII 会 TypeError（500），必须挡住。
+        inner = _Recorder()
+        events = self._call(
+            TokenAuthMiddleware(inner, self.TOKEN),
+            [(b"authorization", "Bearer 令牌".encode("utf-8"))],
+        )
+        self.assertEqual(events[0]["status"], 401)
+        self.assertFalse(inner.called)
+
+    def test_empty_token_rejects_everything(self):
+        inner = _Recorder()
+        for headers in (
+            None,
+            [(b"authorization", b"Bearer ")],
+            [(b"authorization", b"Bearer anything")],
+        ):
+            with self.subTest(headers=headers):
+                events = self._call(TokenAuthMiddleware(inner, ""), headers)
+                self.assertEqual(events[0]["status"], 401)
+        self.assertFalse(inner.called)
+
+    def test_websocket_is_closed_not_forwarded(self):
+        inner = _Recorder()
+        events = self._run(
+            TokenAuthMiddleware(inner, self.TOKEN), {"type": "websocket"}
+        )
+        self.assertFalse(inner.called)
+        self.assertEqual(events[0]["type"], "websocket.close")
+        self.assertEqual(events[0]["code"], 1008)
 
     def test_lifespan_scope_passes_through(self):
         seen = []

@@ -2,7 +2,9 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
+from local_sql_manager.services import library as library_module
 from local_sql_manager.services.library import (
     META_VERSION,
     ensure_meta,
@@ -10,6 +12,57 @@ from local_sql_manager.services.library import (
     open_library,
 )
 from local_sql_manager.services.models import UnsupportedFormat
+
+
+class _NoWalConnection:
+    """把 journal_mode 那条 PRAGMA 变成失败，模拟 -shm 建不出来的文件系统。"""
+
+    def __init__(self, conn):
+        object.__setattr__(self, "_conn", conn)
+
+    def execute(self, sql, *args):
+        # 只让「设置」失败，读取 journal_mode 的断言仍要能走真实连接。
+        if "journal_mode" in sql.lower() and "=" in sql:
+            raise sqlite3.OperationalError("unable to open database file")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._conn, name, value)
+
+
+class TestWalFallback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "共享盘.sqlite")
+        self.real_connect = library_module._connect
+
+    def test_open_succeeds_without_wal_when_shm_unavailable(self):
+        opened = []
+
+        def connect(path):
+            conn = _NoWalConnection(self.real_connect(path))
+            opened.append(conn)
+            return conn
+
+        with mock.patch.object(library_module, "_connect", side_effect=connect):
+            with self.assertLogs(
+                "local_sql_manager.services.library", level="WARNING"
+            ) as logs:
+                lib = open_library(self.path)
+        self.addCleanup(lib.conn.close)
+
+        self.assertTrue(any("WAL" in line for line in logs.output))
+        mode = lib.conn.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertNotEqual(mode.lower(), "wal")
+        # 回落之后库照常可用：元数据表和普通读写都在。
+        self.assertEqual(meta_version(lib.conn), META_VERSION)
+        lib.conn.execute('CREATE TABLE "t" ("id" INTEGER PRIMARY KEY)')
+        lib.conn.commit()
+        self.assertEqual(lib.conn.execute('SELECT COUNT(*) FROM "t"').fetchone()[0], 0)
 
 
 class TestLibrary(unittest.TestCase):

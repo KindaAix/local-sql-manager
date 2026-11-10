@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import sys
 import tempfile
 import types
@@ -28,6 +29,7 @@ from local_sql_manager.desktop.launcher import (
 )
 from local_sql_manager.desktop.logging_setup import setup_logging
 from local_sql_manager.desktop.tray import TRAY_MENU_LABELS
+from local_sql_manager.services.library import open_library
 
 
 class _FakeMenuItem:
@@ -157,7 +159,8 @@ class TestConfig(unittest.TestCase):
     def test_broken_json_falls_back_to_defaults(self):
         config_path().parent.mkdir(parents=True, exist_ok=True)
         config_path().write_text("{not json", encoding="utf-8")
-        self.assertEqual(load_config()["port"], 8765)
+        with self.assertLogs("local_sql_manager.desktop.config", level="WARNING"):
+            self.assertEqual(load_config()["port"], 8765)
 
     def test_out_of_range_ports_fall_back(self):
         self._write({"port": 70000, "mcp_port": -5})
@@ -187,11 +190,61 @@ class TestConfig(unittest.TestCase):
         self._write({"mcp_token": "keep-me"})
         self.assertEqual(load_config()["mcp_token"], "keep-me")
 
+    def test_broken_json_rewrites_with_stable_token(self):
+        config_path().parent.mkdir(parents=True, exist_ok=True)
+        config_path().write_text("{not json", encoding="utf-8")
+        with self.assertLogs("local_sql_manager.desktop.config", level="WARNING"):
+            token = load_config()["mcp_token"]
+        self.assertTrue(token)
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+        self.assertEqual(saved["mcp_token"], token)
+        # 已经写回磁盘，再读不会换 token，粘贴出去的 MCP 配置不会失效。
+        self.assertEqual(load_config()["mcp_token"], token)
+
+    def test_non_ascii_token_is_replaced(self):
+        self._write({"mcp_token": "令牌"})
+        token = load_config()["mcp_token"]
+        self.assertNotEqual(token, "令牌")
+        token.encode("ascii")
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+        self.assertEqual(saved["mcp_token"], token)
+
     def test_string_booleans_are_explicit(self):
         self._write({"mcp_read_only": "false"})
         self.assertFalse(load_config()["mcp_read_only"])
         self._write({"mcp_read_only": "yes"})
         self.assertTrue(load_config()["mcp_read_only"])
+
+
+class TestCheckpoint(unittest.TestCase):
+    def test_checkpoint_runs_truncate(self):
+        conn = mock.Mock()
+        launcher.checkpoint_library(mock.Mock(conn=conn))
+        conn.execute.assert_called_once_with("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def test_checkpoint_failure_only_warns(self):
+        conn = mock.Mock()
+        conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
+        with self.assertLogs("local_sql_manager.desktop.launcher", level="WARNING"):
+            launcher.checkpoint_library(mock.Mock(conn=conn))
+
+    def test_checkpoint_flushes_wal(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "lib.sqlite"
+        lib = open_library(str(path))
+        self.addCleanup(lib.conn.close)
+
+        lib.conn.execute('CREATE TABLE "t" ("id" INTEGER)')
+        lib.conn.execute('INSERT INTO "t" VALUES (1)')
+        lib.conn.commit()
+        wal = Path(str(path) + "-wal")
+        self.assertTrue(wal.exists())
+        self.assertGreater(wal.stat().st_size, 0)
+
+        launcher.checkpoint_library(lib)
+        # 主库已拿到全部页；-wal 被截断（连接还开着时文件可能以 0 字节存在）。
+        self.assertFalse(wal.exists() and wal.stat().st_size > 0)
 
 
 class TestLogging(unittest.TestCase):
@@ -300,11 +353,16 @@ class TestMain(unittest.TestCase):
         name = f"lsm-test-{uuid4()}"
         with mock.patch.object(launcher, "APP_MUTEX", name), mock.patch.object(
             launcher, "run_tray"
-        ) as run_tray, mock.patch.object(launcher, "open_browser") as open_browser:
+        ) as run_tray, mock.patch.object(
+            launcher, "open_browser"
+        ) as open_browser, mock.patch.object(
+            launcher, "checkpoint_library", wraps=launcher.checkpoint_library
+        ) as checkpoint:
             self.assertEqual(launcher.main(), 0)
         self.assertTrue(db.exists())
         run_tray.assert_called_once()
         open_browser.assert_called_once()
+        checkpoint.assert_called_once()
         # 退出后单实例锁已释放，可以再次获取。
         self.assertTrue(acquire_single_instance(name))
         release_single_instance(name)

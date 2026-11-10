@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 APP_DIR_NAME = "LocalSQLManager"
 DEFAULT_PORT = 8765
@@ -74,7 +77,8 @@ def _save_config(payload: dict) -> None:
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(tmp, path)
-    except OSError:
+    except OSError as exc:
+        logger.warning("无法写入配置文件 %s：%s", path, exc)
         try:
             tmp.unlink()
         except OSError:
@@ -115,7 +119,13 @@ def _coerce(key: str, value):
     if key == "mcp_read_only":
         return _bool_or_default(value)
     if key == "mcp_token":
-        return value.strip() if isinstance(value, str) else ""
+        text = value.strip() if isinstance(value, str) else ""
+        # token 只走 HTTP 头/查询串，非 ASCII 会让比较与展示都出问题，按缺失处理。
+        try:
+            text.encode("ascii")
+        except UnicodeEncodeError:
+            return ""
+        return text
     if key == "last_library":
         return str(value) if value else None
     return str(value)
@@ -134,10 +144,19 @@ def load_config() -> dict:
     except FileNotFoundError:
         _save_config(dict(config))
         return config
-    except (OSError, ValueError):
-        # 配置文件坏了：用默认值继续跑，但不覆盖用户文件。
+    except ValueError:
+        # 文件内容解析不了：用默认配置继续跑并覆盖写回，否则每次启动都会
+        # 轮换 token，用户已粘贴到 MCP 客户端的配置会静默失效。
+        logger.warning("配置文件无法解析，已按默认配置重写，MCP token 已轮换")
+        _save_config(dict(config))
+        return config
+    except OSError as exc:
+        # 读不了（权限、被占用）：不覆盖用户文件，但要说明 token 无法保持。
+        logger.warning("无法读取配置文件，MCP token 本次启动会重新生成：%s", exc)
         return config
     if not isinstance(raw, dict):
+        logger.warning("配置文件不是对象，已按默认配置重写，MCP token 已轮换")
+        _save_config(dict(config))
         return config
     for key in config:
         if key in raw:

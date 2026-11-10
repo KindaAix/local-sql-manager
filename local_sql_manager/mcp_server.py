@@ -200,6 +200,12 @@ def _check_filters(conn: sqlite3.Connection, table: str, filters) -> list:
         op = item.get("op")
         if op not in query.OPS.get(by_name[column].type, ()):
             raise ValueError(f"筛选条件不支持：{column} 不支持操作符 {op}")
+        value = item.get("value")
+        if op not in ("empty", "not_empty", "is_true", "is_false") and (
+            value is None or (isinstance(value, str) and not value.strip())
+        ):
+            # build_where 对空取值是静默跳过，这里必须报错，否则等于没筛。
+            raise ValueError("筛选条件缺少取值")
         checked.append(item)
     return checked
 
@@ -303,14 +309,24 @@ class TokenAuthMiddleware:
         self.token = token
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http":
+        kind = scope.get("type")
+        if kind == "lifespan":
             await self.app(scope, receive, send)
+            return
+        if kind != "http":
+            # MCP 只用 http 与 lifespan；websocket 等一律不转给内部应用。
+            if kind == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
             return
         header = _header_value(scope, b"authorization").strip()
         supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
         if not supplied:
             supplied = _query_token(scope)
-        if not self.token or not hmac.compare_digest(supplied, self.token):
+        # compare_digest 的 str 版本遇到非 ASCII 会抛 TypeError（变成 500），
+        # 统一 encode 成 bytes 再比。
+        if not self.token or not hmac.compare_digest(
+            supplied.encode("utf-8"), self.token.encode("utf-8")
+        ):
             body = UNAUTHORIZED_TEXT.encode("utf-8")
             await send(
                 {
@@ -331,7 +347,8 @@ def make_http_app(mcp: FastMCP, path: str = "/mcp"):
     """FastMCP 的 ASGI 应用；build_mcp 传了 token 时套上鉴权中间件。"""
     app = mcp.http_app(path=path)
     token = getattr(mcp, "lsm_token", None)
-    if token:
+    if token is not None:
+        # 空 token 也要套中间件（一律 401），绝不能因为没有 token 就放行。
         return TokenAuthMiddleware(app, token)
     return app
 
