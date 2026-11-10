@@ -276,6 +276,7 @@ class TestImportSheets(ImportTestCase):
         op = audit.history(self.conn, limit=1)[0]
         self.assertEqual(op["kind"], "import")
         self.assertEqual(op["payload"]["file"], "订单.xlsx")
+        self.assertEqual(op["payload"]["tables"], ["订单", "客户"])
         sheets = {item["sheet"]: item for item in op["payload"]["sheets"]}
         self.assertEqual(set(sheets), {"订单", "客户"})
         self.assertEqual(sheets["订单"]["rows"], 2)
@@ -296,6 +297,9 @@ class TestImportSheets(ImportTestCase):
         detail = op["payload"]["sheets"][0]
         self.assertEqual(detail["overwritten"], "订单")
         self.assertIsInstance(detail["overwritten_op"], int)
+        trashed = list_trashed_tables(self.conn)[0]
+        self.assertEqual(detail["overwritten_trashed_as"], trashed["table_name"])
+        self.assertEqual(trashed["trashed_op"], detail["overwritten_op"])
 
 
 class TestHeaderNames(unittest.TestCase):

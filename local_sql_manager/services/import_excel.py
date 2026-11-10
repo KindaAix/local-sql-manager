@@ -21,7 +21,7 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 from . import audit
-from .schema import ColumnSpec, create_table, drop_table
+from .schema import TRASH_PREFIX, ColumnSpec, create_table, drop_table
 from .types import TYPES, coerce, infer_type
 from .util import utcnow_iso
 
@@ -218,24 +218,29 @@ def _copy_name(conn: sqlite3.Connection, base: str) -> str:
 
 def _plan_table(
     conn: sqlite3.Connection, sheet_name: str, on_conflict: str
-) -> tuple[str | None, str | None, int | None]:
+) -> tuple[str | None, dict | None]:
     """决定这张 sheet 要建的表名，以及是否把旧表移入回收站。
 
-    返回 (新表名, 被覆盖的旧表名, 旧表 drop 操作 id)；跳过时新表名为 None。
+    返回 (新表名, 被覆盖旧表的信息)；跳过时新表名为 None。旧表信息里的
+    trashed_as 是回收站物理名，供撤销导入时原样恢复。
     """
     base = _sanitize_table_name(sheet_name)
     existing = _find_object(conn, base)
     if existing is None:
-        return base, None, None
+        return base, None
     existing_name, existing_type = existing
     if on_conflict == "skip":
-        return None, None, None
+        return None, None
     if on_conflict == "copy":
-        return _copy_name(conn, base), None, None
+        return _copy_name(conn, base), None
     if existing_type != "table":
         raise ValueError(f"同名对象已存在，无法覆盖：{existing_name}")
     op = drop_table(conn, existing_name, _SOURCE)
-    return base, existing_name, op
+    return base, {
+        "name": existing_name,
+        "op": op,
+        "trashed_as": f"{TRASH_PREFIX}{op}_{existing_name}",
+    }
 
 
 def _resolve_types(
@@ -365,9 +370,7 @@ def import_sheets(
                 column_types = _resolve_types(
                     sheet_name, columns, worksheet, overrides
                 )
-                table, overwritten, overwritten_op = _plan_table(
-                    conn, sheet_name, on_conflict
-                )
+                table, overwritten = _plan_table(conn, sheet_name, on_conflict)
                 if table is None:
                     continue
                 create_table(
@@ -385,8 +388,13 @@ def import_sheets(
                         "sheet": sheet_name,
                         "table": table,
                         "rows": row_count,
-                        "overwritten": overwritten,
-                        "overwritten_op": overwritten_op,
+                        "overwritten": (
+                            overwritten["name"] if overwritten else None
+                        ),
+                        "overwritten_op": overwritten["op"] if overwritten else None,
+                        "overwritten_trashed_as": (
+                            overwritten["trashed_as"] if overwritten else None
+                        ),
                     }
                 )
 
@@ -398,7 +406,7 @@ def import_sheets(
                     "import",
                     ",".join(created),
                     _SOURCE,
-                    {"file": filename, "sheets": details},
+                    {"file": filename, "tables": list(created), "sheets": details},
                 )
     finally:
         workbook.close()
