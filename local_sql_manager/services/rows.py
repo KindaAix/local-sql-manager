@@ -1,13 +1,16 @@
-"""分页读取与分组汇总。"""
+"""分页读取、分组汇总与行级写入。"""
 
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 
-from .models import Group, PageResult, ViewConfig
+from . import audit
+from .models import ConflictError, Group, PageResult, ViewConfig
 from .query import build_where, page_sql
 from .schema import get_fields
-from .types import cast_expr
+from .types import cast_expr, coerce
+from .util import utcnow_iso
 
 _AGGREGATE_FNS = ("sum", "avg", "min", "max", "count")
 
@@ -149,3 +152,306 @@ def get_page(
         page=page,
         page_size=page_size,
     )
+
+
+# --- 写入 -------------------------------------------------------------
+# 每次写入都在同一事务内完成「读旧值 → 记审计 → 写数据」。本模块的写函数
+# 不提交事务：调用方（路由/MCP/撤销）负责 commit，这样才能让多条服务调用
+# 组成一个原子操作。
+
+_AUX_WRITE_COLUMNS = ("id", "created_at", "updated_at", "deleted_at")
+
+
+@contextmanager
+def _write_txn(conn: sqlite3.Connection):
+    """保证写入在一个事务里完成，但不在本函数内提交。
+
+    调用方已有事务时只开保存点，失败回滚到保存点，不破坏调用方之前的写入；
+    否则自己开启事务并保持到调用方 commit/rollback。
+    """
+    started = not conn.in_transaction
+    if started:
+        conn.execute("BEGIN")
+    conn.execute('SAVEPOINT "lsm_rows_write"')
+    try:
+        yield
+    except BaseException:
+        conn.execute('ROLLBACK TO "lsm_rows_write"')
+        conn.execute('RELEASE "lsm_rows_write"')
+        if started:
+            conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute('RELEASE "lsm_rows_write"')
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [
+        row[1] for row in conn.execute(f"PRAGMA table_info({_quote(table)})")
+    ]
+
+
+def _writable_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [
+        column
+        for column in _table_columns(conn, table)
+        if column not in _AUX_WRITE_COLUMNS
+    ]
+
+
+def _as_id(value: object) -> object:
+    """把 JSON 传来的字符串主键还原成整数；非数字主键保持原样。"""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return value
+
+
+def _fetch_rows(
+    conn: sqlite3.Connection, table: str, ids: list
+) -> dict:
+    """按 id 取整行，返回 {id: dict}。"""
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    cursor = conn.execute(
+        f'SELECT * FROM {_quote(table)} WHERE "id" IN ({placeholders})', ids
+    )
+    names = [description[0] for description in cursor.description]
+    return {
+        row["id"]: row
+        for row in (
+            dict(zip(names, values)) for values in cursor.fetchall()
+        )
+    }
+
+
+def _coerce_value(value: object, field) -> object:
+    return value if field is None else coerce(value, field.type)
+
+
+def _prepare_values(
+    conn: sqlite3.Connection, table: str, values: dict
+) -> dict:
+    """校验列名并按逻辑类型转换取值。"""
+    writable = set(_writable_columns(conn, table))
+    fields = {field.name: field for field in get_fields(conn, table)}
+    prepared = {}
+    for column, value in values.items():
+        if column not in writable:
+            raise ValueError(f"未知列：{column}")
+        prepared[column] = _coerce_value(value, fields.get(column))
+    return prepared
+
+
+def insert_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    rows: list[dict],
+    source: str = "web",
+) -> int:
+    """插入若干行，返回 __lsm_op.id。created_at/updated_at 由服务层写入。"""
+    now = utcnow_iso()
+    with _write_txn(conn):
+        payload_rows = []
+        for item in rows or []:
+            values = _prepare_values(conn, table, dict(item or {}))
+            columns = ["created_at", "updated_at"] + list(values)
+            sql = (
+                f'INSERT INTO {_quote(table)} '
+                f'({", ".join(_quote(column) for column in columns)}) '
+                f'VALUES ({", ".join("?" for _ in columns)})'
+            )
+            params = [now, now] + list(values.values())
+            cursor = conn.execute(sql, params)
+            inserted_id = cursor.lastrowid
+            after = {"id": inserted_id, "created_at": now, "updated_at": now}
+            after.update(values)
+            payload_rows.append(
+                {"id": inserted_id, "before": None, "after": after}
+            )
+        return audit.record(
+            conn, "insert", table, source, {"rows": payload_rows}
+        )
+
+
+def update_cells(
+    conn: sqlite3.Connection,
+    table: str,
+    changes: dict,
+    expected: dict,
+    source: str = "web",
+) -> int:
+    """按行更新若干单元格，使用 updated_at 做乐观锁。
+
+    任何一行与 expected 里的 updated_at 不一致时抛 ConflictError（携带最新行），
+    整批不做任何写入。返回 __lsm_op.id。
+    """
+    requested = {_as_id(key): dict(value or {}) for key, value in (changes or {}).items()}
+    expected = {_as_id(key): value for key, value in (expected or {}).items()}
+    ids = list(requested)
+
+    if not _has_column(conn, table, "updated_at"):
+        raise ValueError(f"表 {table} 没有 updated_at 列，无法启用并发保护")
+
+    now = utcnow_iso()
+    with _write_txn(conn):
+        latest = _fetch_rows(conn, table, ids)
+        prepared = []
+        conflicts = []
+        for rid in ids:
+            row = latest.get(rid)
+            want = expected.get(rid)
+            if row is None:
+                conflicts.append({"id": rid})
+                continue
+            if want is not None and str(row["updated_at"]) != str(want):
+                conflicts.append(row)
+                continue
+            values = _prepare_values(conn, table, requested[rid])
+            prepared.append((rid, row, values))
+
+        if conflicts:
+            raise ConflictError(rows=conflicts)
+
+        payload_rows = [
+            {
+                "id": rid,
+                "before": {column: row[column] for column in values},
+                "after": dict(values),
+            }
+            for rid, row, values in prepared
+        ]
+        op = audit.record(
+            conn, "update", table, source, {"rows": payload_rows}
+        )
+
+        for rid, row, values in prepared:
+            if not values:
+                continue
+            assignments = ", ".join(
+                f"{_quote(column)} = ?" for column in values
+            )
+            cursor = conn.execute(
+                f'UPDATE {_quote(table)} SET {assignments}, "updated_at" = ? '
+                f'WHERE "id" = ? AND "updated_at" = ?',
+                list(values.values()) + [now, rid, row["updated_at"]],
+            )
+            if cursor.rowcount == 0:
+                fresh = _fetch_rows(conn, table, [rid])
+                raise ConflictError(rows=[fresh.get(rid, {"id": rid})])
+    return op
+
+
+def soft_delete(
+    conn: sqlite3.Connection,
+    table: str,
+    ids: list,
+    source: str = "web",
+) -> int:
+    """把若干行移入回收站（写 deleted_at），返回 __lsm_op.id。"""
+    if not _has_column(conn, table, "deleted_at"):
+        raise ValueError(f"表 {table} 没有 deleted_at 列，无法软删除")
+    normalized = [_as_id(value) for value in ids or []]
+    now = utcnow_iso()
+    with _write_txn(conn):
+        latest = _fetch_rows(conn, table, normalized)
+        targets = [
+            (rid, latest[rid])
+            for rid in normalized
+            if rid in latest and latest[rid]["deleted_at"] is None
+        ]
+        payload_rows = [
+            {
+                "id": rid,
+                "before": dict(row),
+                "after": {**row, "deleted_at": now, "updated_at": now},
+            }
+            for rid, row in targets
+        ]
+        op = audit.record(conn, "delete", table, source, {"rows": payload_rows})
+        for rid, _row in targets:
+            conn.execute(
+                f'UPDATE {_quote(table)} SET "deleted_at" = ?, "updated_at" = ? '
+                f'WHERE "id" = ? AND "deleted_at" IS NULL',
+                (now, now, rid),
+            )
+    return op
+
+
+def restore_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    ids: list,
+    source: str = "web",
+) -> int:
+    """把回收站里的行恢复（清空 deleted_at），返回 __lsm_op.id。
+
+    唯一索引冲突时抛 ValueError（提示「唯一」），整批恢复回滚。
+    """
+    if not _has_column(conn, table, "deleted_at"):
+        raise ValueError(f"表 {table} 没有 deleted_at 列，无法恢复")
+    normalized = [_as_id(value) for value in ids or []]
+    now = utcnow_iso()
+    with _write_txn(conn):
+        latest = _fetch_rows(conn, table, normalized)
+        targets = [
+            (rid, latest[rid])
+            for rid in normalized
+            if rid in latest and latest[rid]["deleted_at"] is not None
+        ]
+        payload_rows = [
+            {
+                "id": rid,
+                "before": dict(row),
+                "after": {**row, "deleted_at": None, "updated_at": now},
+            }
+            for rid, row in targets
+        ]
+        op = audit.record(
+            conn, "restore", table, source, {"rows": payload_rows}
+        )
+        try:
+            for rid, _row in targets:
+                conn.execute(
+                    f'UPDATE {_quote(table)} SET "deleted_at" = NULL, '
+                    f'"updated_at" = ? WHERE "id" = ?',
+                    (now, rid),
+                )
+        except sqlite3.IntegrityError as exc:
+            # 部分唯一索引下恢复可能与现存行撞值，给界面一个可读的错误而不是 500。
+            raise ValueError(f"恢复失败：唯一性约束冲突（{exc}）") from exc
+    return op
+
+
+def purge_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    ids: list,
+    source: str = "web",
+) -> int:
+    """彻底删除若干行，审计标记 irreversible。返回 __lsm_op.id。"""
+    normalized = [_as_id(value) for value in ids or []]
+    with _write_txn(conn):
+        latest = _fetch_rows(conn, table, normalized)
+        targets = [(rid, latest[rid]) for rid in normalized if rid in latest]
+        payload_rows = [
+            {"id": rid, "before": dict(row), "after": None}
+            for rid, row in targets
+        ]
+        op = audit.record(
+            conn,
+            "purge",
+            table,
+            source,
+            {"rows": payload_rows},
+            irreversible=True,
+        )
+        for rid, _row in targets:
+            conn.execute(f'DELETE FROM {_quote(table)} WHERE "id" = ?', (rid,))
+    return op
+
