@@ -18,6 +18,7 @@ from local_sql_manager.services.schema import (
     drop_table,
     list_tables,
     list_trashed_tables,
+    rename_table,
 )
 from tests.fixtures.make_fixtures import make_workbook
 
@@ -58,10 +59,9 @@ class TestUndoImport(UndoImportTestCase):
         record = audit.get_op(self.conn, undo_id)
         self.assertEqual(record["kind"], "undo")
         self.assertEqual(record["payload"]["op"], op_id)
-        self.assertEqual(record["payload"]["action"], "undo_import")
         self.assertEqual(record["payload"]["tables"], created)
         self.assertEqual(
-            [item["table"] for item in record["payload"]["trashed"]], created
+            [item["table"] for item in record["payload"]["actions"]], created
         )
         self.assertEqual(record["payload"]["missing"], [])
         self.assertEqual(audit.get_op(self.conn, op_id)["undone_by"], undo_id)
@@ -84,7 +84,7 @@ class TestUndoImport(UndoImportTestCase):
         record = audit.get_op(self.conn, undo_id)
         self.assertEqual(record["payload"]["missing"], ["客户"])
         self.assertEqual(
-            [item["table"] for item in record["payload"]["trashed"]], ["订单"]
+            [item["table"] for item in record["payload"]["actions"]], ["订单"]
         )
         self.assertNotIn("订单", list_tables(self.conn))
         self.assertIn(
@@ -117,6 +117,55 @@ class TestUndoImport(UndoImportTestCase):
         undo.undo(self.conn, structured)
         self.assertNotIn("乙", list_tables(self.conn))
 
+    def test_undo_import_rejects_renamed_table(self):
+        create_table(self.conn, "订单", [ColumnSpec("金额", "number")])
+        op = audit.record(
+            self.conn, "import", "订单", "web", {"tables": ["订单"]}
+        )
+        rename_table(self.conn, "订单", "发票")
+
+        with self.assertRaises(StaleOperation) as caught:
+            undo.undo(self.conn, op)
+        self.assertIn("订单", str(caught.exception))
+        self.assertIsNone(audit.get_op(self.conn, op)["undone_by"])
+        self.assertIn("发票", list_tables(self.conn))
+        self.assertEqual(list_trashed_tables(self.conn), [])
+
+    def test_undo_import_matches_table_names_case_insensitively(self):
+        create_table(self.conn, "Orders", [ColumnSpec("名称", "text")])
+        op = audit.record(
+            self.conn, "import", "Orders", "web", {"tables": ["orders"]}
+        )
+
+        undo.undo(self.conn, op)
+        self.assertNotIn("Orders", list_tables(self.conn))
+        self.assertIn(
+            "Orders", [item["name"] for item in list_trashed_tables(self.conn)]
+        )
+
+    def test_undo_import_treats_bare_string_tables(self):
+        create_table(self.conn, "甲", [ColumnSpec("名称", "text")])
+        op = audit.record(self.conn, "import", "甲", "web", {"tables": "甲"})
+
+        undo.undo(self.conn, op)
+        self.assertNotIn("甲", list_tables(self.conn))
+
+    def test_undo_import_strips_whitespace_in_names(self):
+        create_table(self.conn, "乙", [ColumnSpec("名称", "text")])
+        op = audit.record(
+            self.conn, "import", "乙", "web", {"tables": ["  乙  "]}
+        )
+
+        undo.undo(self.conn, op)
+        self.assertNotIn("乙", list_tables(self.conn))
+
+    def test_undo_import_rejects_malformed_tables(self):
+        op = audit.record(
+            self.conn, "import", "订单", "web", {"tables": {"table": "订单"}}
+        )
+        with self.assertRaises(StaleOperation):
+            undo.undo(self.conn, op)
+
     def test_undo_import_leaves_overwritten_table_in_trash(self):
         create_table(self.conn, "订单", [ColumnSpec("金额", "number")])
         _, op_id = self.run_import(["订单"], on_conflict="overwrite")
@@ -127,11 +176,14 @@ class TestUndoImport(UndoImportTestCase):
         # 旧表仍在回收站，撤销导入不会把它顺手恢复。
         self.assertEqual(len(list_trashed_tables(self.conn)), 2)
 
-    def test_undo_of_undone_import_is_unsupported(self):
+    def test_undo_of_undone_import_restores_tables(self):
         _, op_id = self.run_import(["订单"])
         undo_id = undo.undo(self.conn, op_id)
-        with self.assertRaises(StaleOperation):
-            undo.undo(self.conn, undo_id)
+        self.assertEqual(list_tables(self.conn), [])
+
+        undo.undo(self.conn, undo_id)
+        self.assertIn("订单", list_tables(self.conn))
+        self.assertEqual(list_trashed_tables(self.conn), [])
 
 
 class TestHandlerRegistration(unittest.TestCase):
