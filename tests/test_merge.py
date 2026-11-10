@@ -137,10 +137,23 @@ class TestPlanMerge(MergeTestBase):
         self.assertIn("源表重复", str(caught.exception))
 
     def test_tables_must_be_a_list(self):
-        for bad in ("一月", None, 3):
+        bad_inputs = [
+            "一月",
+            None,
+            3,
+            {"一月", "二月"},
+            {"一月": 1, "二月": 2},
+        ]
+        for bad in bad_inputs:
             with self.assertRaises(ValueError) as caught:
                 merge.plan_merge(self.conn, bad, "合计")
             self.assertIn("源表必须是表名列表", str(caught.exception))
+
+    def test_tables_accepts_tuple_and_generator(self):
+        for tables in (("一月", "二月"), (name for name in ("一月", "二月"))):
+            plan = merge.plan_merge(self.conn, tables, "合计")
+            self.assertEqual(plan["columns"], ["金额", "备注"])
+            self.assertEqual(plan["rows"], 4)
 
     def test_plan_writes_nothing(self):
         before = self.conn.execute('SELECT COUNT(*) FROM "__lsm_op"').fetchone()[0]
@@ -256,6 +269,26 @@ class TestMergeTables(MergeTestBase):
         self.assertEqual(fields["状态"].options, ("待办", "完成", "延期"))
         self.assertEqual(self.column("合计", "状态"), ["待办", "延期"])
 
+    def test_options_dropped_when_target_type_is_not_select(self):
+        self.make("文本表", [("状态", "text")], [("自由文本",)])
+        self.make("选项表", [("状态", "select", ("待办", "完成"))], [("待办",)])
+        plan = merge.plan_merge(self.conn, ["文本表", "选项表"], "合计")
+        self.assertEqual(
+            plan["conflicts"],
+            [
+                {
+                    "column": "状态",
+                    "types": {"文本表": "text", "选项表": "select"},
+                    "options": {"文本表": [], "选项表": ["待办", "完成"]},
+                }
+            ],
+        )
+        merge.merge_tables(self.conn, ["文本表", "选项表"], "合计")
+        fields = {field.name: field for field in get_fields(self.conn, "合计")}
+        self.assertEqual(fields["状态"].type, "text")
+        self.assertEqual(fields["状态"].options, ())
+        self.assertEqual(self.count("合计"), 2)
+
     def test_same_options_are_not_a_conflict(self):
         self.make("甲", [("状态", "select", ("待办", "完成"))], [("待办",)])
         self.make("乙", [("状态", "select", ("完成", "待办"))], [("完成",)])
@@ -291,7 +324,8 @@ class TestMergeTables(MergeTestBase):
         self.assertEqual(entry["payload"]["tables"], ["一月", "二月"])
         self.assertEqual(entry["payload"]["columns"], ["金额", "备注"])
         self.assertEqual(entry["payload"]["conflicts"], [])
-        self.assertEqual(entry["payload"]["rows"], 4)
+        self.assertEqual(entry["payload"]["row_count"], 4)
+        self.assertNotIn("rows", entry["payload"])
 
     def test_source_argument_goes_to_audit(self):
         op = merge.merge_tables(self.conn, ["一月", "二月"], "合计", source="mcp")

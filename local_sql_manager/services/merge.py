@@ -73,6 +73,10 @@ AUX_NAMES = tuple(name for name, _ in schema.AUX_COLUMNS)
 _SAVEPOINT = "lsm_merge"
 
 
+# 只有这两种逻辑类型允许带选项；其余类型即使源表登记了 options 也不能带进目标表。
+_OPTION_TYPES = ("select", "multiselect")
+
+
 @dataclass
 class _Column:
     """一个目标列：显示名、逻辑类型、选项，以及每张源表里对应的源列名。"""
@@ -86,9 +90,12 @@ class _Column:
 
     @property
     def conflicting(self) -> bool:
-        return len(set(self.types.values())) > 1 or len(
-            {frozenset(options) for options in self.table_options.values()}
-        ) > 1
+        return len(set(self.types.values())) > 1 or _options_vary(self)
+
+
+def _options_vary(column: _Column) -> bool:
+    """各源表给同一列登记的选项集合是否不一致；顺序不同不算。"""
+    return len({frozenset(options) for options in column.table_options.values()}) > 1
 
 
 def _quote(name: str) -> str:
@@ -167,6 +174,12 @@ def _check_column_name(name: str) -> str:
     return name
 
 
+def _keep_options_for_type(column: _Column) -> None:
+    """字段不变量：只有 select/multiselect 能带选项，其它类型清空。"""
+    if column.type not in _OPTION_TYPES:
+        column.options = ()
+
+
 def _union_options(current: tuple, extra) -> tuple:
     """把 extra 里没见过的选项按原顺序追加到 current。"""
     merged = list(current)
@@ -210,7 +223,10 @@ def _columns_from_union(sources: list[str], fields: dict) -> list[_Column]:
             column.types[table] = field.type
             column.table_options[table] = tuple(field.options)
             column.options = _union_options(column.options, field.options)
-    return [merged[key] for key in order]
+    columns = [merged[key] for key in order]
+    for column in columns:
+        _keep_options_for_type(column)
+    return columns
 
 
 def _columns_from_mapping(mapping, sources: list[str], fields: dict) -> list[_Column]:
@@ -248,6 +264,7 @@ def _columns_from_mapping(mapping, sources: list[str], fields: dict) -> list[_Co
             raise ValueError(f"列映射「{name}」没有指向任何源列")
         # 类型取 tables 顺序中第一张包含该列的源表，保证与并集口径一致。
         column.type = next(column.types[table] for table in sources if table in column.types)
+        _keep_options_for_type(column)
         columns.append(column)
     return columns
 
@@ -269,7 +286,7 @@ def _check_physical_columns(conn: sqlite3.Connection, columns: list[_Column]) ->
 
 def _conflict_entry(column: _Column) -> dict:
     entry = {"column": column.name, "types": dict(column.types)}
-    if len({frozenset(options) for options in column.table_options.values()}) > 1:
+    if _options_vary(column):
         entry["options"] = {
             table: list(options) for table, options in column.table_options.items()
         }
@@ -278,7 +295,11 @@ def _conflict_entry(column: _Column) -> dict:
 
 def _analyze(conn: sqlite3.Connection, tables, target, mapping=None):
     """校验输入并算出目标列、源表行数与类型/选项冲突。"""
-    if isinstance(tables, str) or not hasattr(tables, "__iter__"):
+    if (
+        isinstance(tables, (str, bytes, dict, set, frozenset))
+        or not hasattr(tables, "__iter__")
+    ):
+        # set/dict 的迭代顺序不稳定，会让列顺序与行顺序不可复现。
         raise ValueError("源表必须是表名列表")
     names = [str(table).strip() for table in tables]
     if len(names) < 2:
@@ -364,7 +385,8 @@ def merge_tables(
                 "tables": [table for table, _ in counts],
                 "columns": [column.name for column in columns],
                 "conflicts": conflicts,
-                "rows": expected,
+                # 不要叫 "rows"：undo 约定 payload["rows"] 是行差分列表。
+                "row_count": expected,
             },
         )
         schema.create_table(

@@ -231,7 +231,11 @@ def _later_ops_touch_row(
             payload = json.loads(raw) if raw else {}
         except (TypeError, ValueError):
             continue
-        for item in payload.get("rows") or []:
+        payload_rows = payload.get("rows")
+        if not isinstance(payload_rows, list):
+            # 非行级操作（如 merge 的 payload）没有行差分，跳过。
+            continue
+        for item in payload_rows:
             if not isinstance(item, dict):
                 continue
             row_id = _as_id(item.get("id"))
