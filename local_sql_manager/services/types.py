@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import date, datetime
 from typing import Sequence
 
@@ -23,6 +24,8 @@ _CAST_TYPES = {
 _CHECKBOX_VALUES = {"是", "否", "true", "false"}
 
 _DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d")
+
+_PURE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _quote_ident(name: str) -> str:
@@ -58,6 +61,11 @@ def _has_leading_zero(text: str) -> bool:
     return len(body) > 1 and body[0] == "0" and body[1:].isdigit()
 
 
+def _is_pure_date(text: str) -> bool:
+    """仅把 YYYY-MM-DD 形式的纯日期视为日期列。"""
+    return bool(_PURE_DATE_RE.match(text)) and _parse_date(text) is not None
+
+
 def _is_checkbox(text: str) -> bool:
     return text.lower() in _CHECKBOX_VALUES
 
@@ -75,12 +83,12 @@ def infer_type(values: Sequence[str]) -> tuple[str, bool]:
         return ("text", False)
     if all(_is_number(value) for value in cleaned):
         return ("number", False)
-    if all(_parse_date(value) is not None for value in cleaned):
+    if all(_is_pure_date(value) for value in cleaned):
         return ("date", False)
     if all(_is_checkbox(value) for value in cleaned):
         return ("checkbox", False)
     if any(
-        _is_number(value) or _parse_date(value) is not None or _is_checkbox(value)
+        _is_number(value) or _is_pure_date(value) or _is_checkbox(value)
         for value in cleaned
     ):
         return ("text", True)

@@ -80,12 +80,22 @@ class Library:
     path: str
 
 
+def _has_meta(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='__lsm_meta'"
+    ).fetchone()
+    return row is not None
+
+
 def ensure_meta(conn: sqlite3.Connection) -> None:
-    """建立元数据表，并在缺失时写入当前格式版本。"""
+    """建立元数据表，并把格式版本校正为当前版本。"""
     for statement in SCHEMA:
         conn.execute(statement)
     conn.execute(
-        'INSERT OR IGNORE INTO "__lsm_meta" ("key", "value") VALUES (?, ?)',
+        """
+        INSERT INTO "__lsm_meta" ("key", "value") VALUES (?, ?)
+        ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"
+        """,
         ("version", str(META_VERSION)),
     )
     conn.commit()
@@ -96,20 +106,29 @@ def meta_version(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         'SELECT "value" FROM "__lsm_meta" WHERE "key" = ?', ("version",)
     ).fetchone()
-    return int(row[0]) if row else 0
+    if row is None:
+        return 0
+    raw = row[0]
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise UnsupportedFormat(f"库格式版本无法识别：{raw!r}") from None
 
 
 def open_library(path: str) -> Library:
-    """打开库文件，准备好元数据表并校验格式版本。"""
+    """打开库文件，校验格式版本后准备好元数据表。"""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    ensure_meta(conn)
-
-    version = meta_version(conn)
-    if version > META_VERSION:
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        if _has_meta(conn):
+            version = meta_version(conn)
+            if version > META_VERSION:
+                raise UnsupportedFormat(
+                    f"库格式版本 {version} 高于当前应用支持的 {META_VERSION}"
+                )
+        ensure_meta(conn)
+    except Exception:
         conn.close()
-        raise UnsupportedFormat(
-            f"库格式版本 {version} 高于当前应用支持的 {META_VERSION}"
-        )
+        raise
     return Library(conn=conn, path=path)

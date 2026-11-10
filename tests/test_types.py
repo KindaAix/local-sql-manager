@@ -25,6 +25,25 @@ class TestInferType(unittest.TestCase):
     def test_decimals_are_numbers(self):
         self.assertEqual(infer_type(["1.5", "2.25"]), ("number", False))
 
+    def test_datetime_with_time_is_text(self):
+        self.assertEqual(
+            infer_type(["2026-01-02 10:00:00"]), ("text", False)
+        )
+        self.assertEqual(
+            infer_type(["2026-01-02T10:00:00Z"]), ("text", False)
+        )
+
+    def test_compact_digits_are_not_dates(self):
+        self.assertEqual(infer_type(["20260102"]), ("number", False))
+
+    def test_mixed_date_and_datetime_is_suspicious(self):
+        self.assertEqual(
+            infer_type(["2026-01-02", "2026-01-02 10:00:00"]), ("text", True)
+        )
+
+    def test_invalid_calendar_date_is_text(self):
+        self.assertEqual(infer_type(["2026-02-30"]), ("text", False))
+
     def test_boolean_words_are_checkbox(self):
         self.assertEqual(infer_type(["TRUE", "false"]), ("checkbox", False))
 

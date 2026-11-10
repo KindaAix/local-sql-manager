@@ -29,4 +29,8 @@ local-sql-manager = "local_sql_manager.desktop.launcher:main"
 include = ["local_sql_manager*"]
 
 [tool.setuptools.package-data]
-local_sql_manager = ["templates/**/*.html", "static/**/*"]
+local_sql_manager = [
+    "templates/*.html",
+    "templates/**/*.html",
+    "static/**/*",
+]
