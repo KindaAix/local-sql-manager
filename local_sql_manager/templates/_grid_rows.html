@@ -1,22 +1,3 @@
-{% macro cell_text(row, column) -%}
-{%- if column.type == 'checkbox' -%}
-{%- if row.get(column.name) %}是{% endif -%}
-{%- elif column.type == 'local_time' -%}
-{{ row.get(column.name) | local_time }}
-{%- elif row.get(column.name) is none -%}
-{%- else -%}
-{{ row.get(column.name) | cell }}
-{%- endif -%}
-{%- endmacro %}
-
-{% macro grid_row(row) -%}
-<tr class="grid-row">
-  {% for column in columns %}
-  <td class="cell">{{ cell_text(row, column) }}</td>
-  {% endfor %}
-</tr>
-{%- endmacro %}
-
 {% if grouped %}
   {% for block in blocks %}
   <tr class="group-row">
@@ -27,10 +8,10 @@
       {%- for item in block.aggregates %}<span class="group-agg">{{ item.label }}：{% if item.value is none %}—{% else %}{{ item.value | cell }}{% endif %}</span>{% endfor %}
     </td>
   </tr>
-  {% for row in block.rows %}{{ grid_row(row) }}{% endfor %}
+  {% for row in block.rows %}{% include "_grid_row.html" %}{% endfor %}
   {% endfor %}
 {% elif page.rows %}
-  {% for row in page.rows %}{{ grid_row(row) }}{% endfor %}
+  {% for row in page.rows %}{% include "_grid_row.html" %}{% endfor %}
 {% else %}
   <tr class="empty-row">
     <td class="empty-cell" colspan="{{ columns | length }}">还没有数据</td>

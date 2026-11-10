@@ -49,6 +49,8 @@ def create_app(library: Library | None = None) -> Flask:
 
     # 蓝图在函数内导入：routes 反过来要从本模块取 get_conn，顶层导入会成环。
     from .routes.grid import bp as grid_bp
+    from .routes.grid_api import bp as grid_api_bp
 
     app.register_blueprint(grid_bp)
+    app.register_blueprint(grid_api_bp)
     return app
