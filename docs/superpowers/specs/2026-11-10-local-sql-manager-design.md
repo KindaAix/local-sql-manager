@@ -151,7 +151,7 @@ __lsm_trash_col (op_id INTEGER, table_name TEXT, column TEXT, type TEXT,
 - **分组与分页的组合语义**：仍按行分页；组头显示该组在整个筛选集下的总条数与汇总（单独一条 `GROUP BY` 查询），组跨页时组头标「（续）」。页脚同时显示「第 1–100 行 / 共 N 行」。
 
 ### 7.4 撤销与历史
-- 每次写入生成 `__lsm_op`，`kind` 覆盖：`insert` / `update` / `delete` / `restore` / `purge` / `import` / `merge` / `undo` / `create_table` / `rename_table` / `drop_table` / `restore_table` / `create_field` / `rename_field` / `drop_field` / `view`。
+- 每次写入生成 `__lsm_op`，`kind` 覆盖：`insert` / `update` / `delete` / `restore` / `purge`（行级彻底删除）/ `import` / `merge` / `undo` / `create_table` / `rename_table` / `drop_table` / `restore_table` / `purge_table`（表级彻底删除）/ `create_field` / `rename_field` / `drop_field` / `view`。
 - `payload_json` 记受影响行 id 与前后值；表级操作记表名；删列把整列值写入 `__lsm_trash_col` 以便撤销回填。
 - 撤销 = 执行相反操作，并写一条指向原操作的 `undo` 记录；撤销可被撤销。
 - 入口两处：右下角 toast「已删除 3 条 · 撤销」（仅最近一次）；侧栏「操作历史」页（整库/按表筛选，逐条回退）。
