@@ -596,6 +596,12 @@ class TestUndoDropField(BaseFieldCase):
         self.assertIsNone(self.cell(self.second, "备注"))
         self.assertEqual(self.names(), ["状态", "金额", "备注"])
 
+    def test_undo_rebuilds_system_index_after_extra_index_drop(self):
+        self.conn.execute('CREATE INDEX "我的索引" ON "订单" ("金额")')
+        op = fields.drop_field(self.conn, "订单", "金额")
+        undo_service.undo(self.conn, op)
+        self.assertIn("__lsm_idx_2_订单_2_金额", self.indexes())
+
     def test_restores_type_and_index(self):
         op = fields.drop_field(self.conn, "订单", "金额")
         undo_service.undo(self.conn, op)
