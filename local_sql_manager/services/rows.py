@@ -21,6 +21,14 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in rows)
 
 
+def _has_rowid(conn: sqlite3.Connection, table: str) -> bool:
+    """判断普通表是否有 rowid；WITHOUT ROWID 表只能靠扫描顺序。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    return row is not None and "WITHOUT ROWID" not in (row[0] or "").upper()
+
+
 def _conditions(view: ViewConfig, fields: list, soft_delete: bool) -> tuple[list, list]:
     where, params = build_where(view.filters, fields)
     conditions = ['"deleted_at" IS NULL'] if soft_delete else []
@@ -84,12 +92,26 @@ def get_page(
 ) -> PageResult:
     """读取一页数据；total 与 groups 均按整个筛选集统计。"""
     view = view or ViewConfig()
-    page = max(1, int(page))
-    page_size = max(1, int(page_size))
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = int(page_size)
+    except (TypeError, ValueError):
+        page_size = 100
+    page = max(1, page)
+    page_size = min(1000, max(1, page_size))
+
     fields = get_fields(conn, table)
     soft_delete = _has_column(conn, table, "deleted_at")
     # 没有 id 列时退回 rowid，避免 ORDER BY "id" 被 SQLite 当成常量而静默失效。
-    tiebreaker = '"id"' if _has_column(conn, table, "id") else "rowid"
+    if _has_column(conn, table, "id"):
+        tiebreaker = '"id"'
+    elif _has_rowid(conn, table):
+        tiebreaker = "rowid"
+    else:
+        tiebreaker = None
 
     sql, params = page_sql(
         table,

@@ -48,8 +48,8 @@ def _quote(name: str) -> str:
 
 
 def _index_name(table: str, column: str) -> str:
-    """索引名带表名长度前缀，避免 "a_b"+"c" 与 "a"+"b_c" 撞名。"""
-    return f"__lsm_idx_{len(table)}_{table}_{column}"
+    """索引名带表名与列名长度前缀，避免 "a_b"+"c" 与 "a"+"b_c" 撞名。"""
+    return f"__lsm_idx_{len(table)}_{table}_{len(column)}_{column}"
 
 
 @contextmanager
@@ -76,8 +76,8 @@ def create_table(
 
     调用方若已开启事务，本函数加入该事务；否则自身提交。
     """
-    if str(name).startswith("__lsm_"):
-        raise ValueError(f"表名不能使用内部前缀 __lsm_：{name}")
+    if str(name).lower().startswith(("__lsm_", "sqlite_")):
+        raise ValueError(f"表名不能使用内部前缀：{name}")
     specs = list(columns)
     for spec in specs:
         if spec.type not in TYPES:

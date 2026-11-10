@@ -41,7 +41,7 @@ class TestSchema(unittest.TestCase):
     def test_creates_index_per_business_column(self):
         create_table(self.conn, "订单", [ColumnSpec("金额", "number")])
         idx = [r["name"] for r in self.conn.execute('PRAGMA index_list("订单")')]
-        self.assertIn("__lsm_idx_2_订单_金额", idx)
+        self.assertIn("__lsm_idx_2_订单_2_金额", idx)
 
     def test_physical_column_types(self):
         create_table(
@@ -93,7 +93,7 @@ class TestSchema(unittest.TestCase):
         create_table(self.conn, "订单", [ColumnSpec("金额", "number")])
         ensure_indexes(self.conn, "订单")
         idx = [r["name"] for r in self.conn.execute('PRAGMA index_list("订单")')]
-        self.assertEqual(idx.count("__lsm_idx_2_订单_金额"), 1)
+        self.assertEqual(idx.count("__lsm_idx_2_订单_2_金额"), 1)
 
     def test_index_names_do_not_collide_across_tables(self):
         create_table(self.conn, "a_b", [ColumnSpec("c", "text")])
@@ -107,6 +107,12 @@ class TestSchema(unittest.TestCase):
     def test_rejects_internal_table_name(self):
         with self.assertRaises(ValueError):
             create_table(self.conn, "__lsm_hidden", [ColumnSpec("金额", "number")])
+
+    def test_rejects_sqlite_table_name(self):
+        with self.assertRaises(ValueError):
+            create_table(self.conn, "sqlite_hidden", [ColumnSpec("金额", "number")])
+        with self.assertRaises(ValueError):
+            create_table(self.conn, "SQLite_hidden", [ColumnSpec("金额", "number")])
 
     def test_rejects_unknown_type(self):
         with self.assertRaises(ValueError):

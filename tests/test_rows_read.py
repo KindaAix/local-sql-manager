@@ -123,15 +123,42 @@ class TestGetPage(unittest.TestCase):
         self.assertEqual(page.total, 1)
         self.assertEqual(page.rows[0]["名称"], "a")
 
+    def test_without_rowid_table_pages_without_order(self):
+        self.conn.execute(
+            'CREATE TABLE "noid2" ("k" TEXT PRIMARY KEY) WITHOUT ROWID'
+        )
+        self.conn.executemany(
+            'INSERT INTO "noid2" ("k") VALUES (?)', [("a",), ("b",)]
+        )
+        page = get_page(self.conn, "noid2", ViewConfig())
+        self.assertEqual(page.total, 2)
+        self.assertEqual(sorted(row["k"] for row in page.rows), ["a", "b"])
+
+    def test_bad_page_falls_back_to_one(self):
+        self.insert("完成", 10)
+        page = get_page(self.conn, "订单", ViewConfig(), page="abc")
+        self.assertEqual(page.page, 1)
+        self.assertEqual(len(page.rows), 1)
+
+    def test_page_size_is_capped(self):
+        self.insert("完成", 10)
+        page = get_page(self.conn, "订单", ViewConfig(), page_size=5000)
+        self.assertEqual(page.page_size, 1000)
+
     def test_table_without_id_pages_by_rowid(self):
         self.conn.execute('CREATE TABLE "noid" ("名称" TEXT)')
         self.conn.executemany(
             'INSERT INTO "noid" ("名称") VALUES (?)', [("a",), ("b",), ("c",)]
         )
-        names = []
-        for number in (1, 2, 3):
-            page = get_page(self.conn, "noid", ViewConfig(), page=number, page_size=1)
-            names.extend(row["名称"] for row in page.rows)
+        first = get_page(self.conn, "noid", ViewConfig(), page=1, page_size=2)
+        second = get_page(self.conn, "noid", ViewConfig(), page=2, page_size=2)
+        names = [row["名称"] for row in first.rows] + [
+            row["名称"] for row in second.rows
+        ]
+        self.assertEqual(len(first.rows) + len(second.rows), 3)
+        self.assertFalse(
+            {row["名称"] for row in first.rows} & {row["名称"] for row in second.rows}
+        )
         self.assertEqual(names, ["a", "b", "c"])
 
 
