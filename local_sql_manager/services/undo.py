@@ -35,9 +35,9 @@ Handler = Callable[[sqlite3.Connection, dict, str], "dict | None"]
 
 _HANDLERS: dict[str, Handler] = {}
 
-# 这些 kind 不改变数据行/表本身，不应阻塞对更早操作的撤销。注意 `undo`
-# 自己也注册了处理器，但它同样不构成「后续修改」；其余豁免项一旦有处理器
-# 注册就必须从这里移除（有自检测试兜底）。
+# 这些 kind 默认不改变数据行/表本身，不应阻塞对更早操作的撤销。豁免是动态的：
+# 某个 kind 一旦注册了撤销处理器，就说明它确实代表一次可回退的数据动作，
+# 必须重新参与阻塞判断。`undo` 永远豁免。
 _NON_DATA_KINDS = ("undo", "view", "create_field", "rename_field", "drop_field")
 
 # 嵌套调用时保存点重名会让内层 RELEASE 直接释放外层，加序号避免复用。
@@ -343,11 +343,17 @@ def _has_later_ops(conn: sqlite3.Connection, table: str, op_id: int) -> bool:
     undo 记录不算：撤销一条后续写入正是解除阻塞的方式；视图/字段元数据
     操作也没有撤销处理器，若算阻塞会让撤销建表变成死路。
     """
-    placeholders = ", ".join("?" for _ in _NON_DATA_KINDS)
+    # 只有仍无处理器的元数据 kind 才豁免；注册处理器后它们必须参与阻塞。
+    exempt = [
+        kind
+        for kind in _NON_DATA_KINDS
+        if kind == "undo" or kind not in _HANDLERS
+    ]
+    placeholders = ", ".join("?" for _ in exempt)
     row = conn.execute(
         'SELECT 1 FROM "__lsm_op" WHERE "id" > ? AND "table_name" = ?'
         f' AND "undone_by" IS NULL AND "kind" NOT IN ({placeholders}) LIMIT 1',
-        (op_id, table, *_NON_DATA_KINDS),
+        (op_id, table, *exempt),
     ).fetchone()
     return row is not None
 

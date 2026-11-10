@@ -448,10 +448,27 @@ class TestUndoTables(BaseUndoTestCase):
         self.assertNotIn("客户", list_tables(self.conn))
         self.assertIn("客户", [item["name"] for item in list_trashed_tables(self.conn)])
 
-    def test_non_data_kinds_have_no_handlers(self):
-        # undo 自己也是处理器；其余豁免项一旦注册了处理器就必须从豁免里移除。
-        exempt = set(undo_service._NON_DATA_KINDS) - {"undo"}
-        self.assertEqual(exempt & set(undo_service._HANDLERS), set())
+    def test_field_op_blocks_create_undo_once_handler_registered(self):
+        op = audit.record(
+            self.conn, "create_table", "客户", "web", {"name": "客户"}
+        )
+        create_table(self.conn, "客户", [ColumnSpec("名称", "text")])
+        audit.record(
+            self.conn, "create_field", "客户", "web", {"column": "备注"}
+        )
+
+        undo_service.register(
+            "create_field", lambda conn, op, source: {}
+        )
+        try:
+            with self.assertRaises(StaleOperation):
+                undo_service.undo(self.conn, op)
+        finally:
+            undo_service.unregister("create_field")
+
+        # 处理器移除后，字段操作重新成为可豁免的元数据 op。
+        undo_service.undo(self.conn, op)
+        self.assertNotIn("客户", list_tables(self.conn))
 
     def test_undo_rename_table_reverts_name(self):
         op = rename_table(self.conn, "订单", "发票")
