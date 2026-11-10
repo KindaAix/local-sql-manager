@@ -5,18 +5,21 @@
 不可删除。所有写函数都不提交事务，由调用方在同一事务内 commit。
 
 审计只覆盖视图本身的增删改名（kind='view'），纯配置更新（筛选、排序、
-隐藏列、列宽、分组）不记，见设计文档 §7.5。
+隐藏列、列宽、分组）不记，见设计文档 §7.4。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import asdict, fields as dc_fields
 
 from . import audit
 from .models import ViewConfig
 from .schema import get_fields
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_VIEW_NAME = "全部记录"
 
@@ -42,6 +45,13 @@ def _require_table(conn: sqlite3.Connection, table: str) -> None:
         raise ValueError(f"表不存在：{table}")
 
 
+def _is_managed(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        'SELECT 1 FROM "__lsm_table" WHERE "table_name" = ?', (table,)
+    ).fetchone()
+    return row is not None
+
+
 def _as_config(config: ViewConfig | dict) -> ViewConfig:
     """允许路由层直接传 JSON 反序列化出的 dict。"""
     if isinstance(config, dict):
@@ -52,8 +62,13 @@ def _as_config(config: ViewConfig | dict) -> ViewConfig:
 
 
 def _prune(config: ViewConfig, table: str, conn: sqlite3.Connection) -> ViewConfig:
-    """丢掉引用已不存在列的配置项，避免删列后留下悬空引用。"""
+    """丢掉引用已不存在列的配置项，避免删列后留下悬空引用。
+
+    未受管表没有字段元数据可依据，原样保留配置；受管表即使暂无业务列也照常裁剪。
+    """
     known = {field.name for field in get_fields(conn, table)}
+    if not known and not _is_managed(conn, table):
+        return config
 
     def known_column(item: object) -> bool:
         return isinstance(item, dict) and item.get("column") in known
@@ -80,12 +95,28 @@ def _encode(config: ViewConfig) -> str:
 
 
 def _decode(raw: str | None) -> ViewConfig:
+    """解析 config_json；坏数据退化为空配置，避免整页 500。"""
     if not raw:
         return ViewConfig()
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("视图配置 JSON 无法解析，已按空配置处理：%r", raw)
+        return ViewConfig()
     if not isinstance(data, dict):
         return ViewConfig()
     return ViewConfig(**{k: v for k, v in data.items() if k in _CONFIG_FIELDS})
+
+
+def _payload_config(raw: str | None) -> dict:
+    """把库里的 config_json 还原成可写进审计 payload 的 dict。"""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _to_dict(row: sqlite3.Row | tuple) -> dict:
@@ -147,9 +178,9 @@ def create_view(
     表还没有默认视图时，新视图即默认视图。不提交事务。
     """
     _require_table(conn, table)
-    name = (name or "").strip()
-    if not name:
+    if not isinstance(name, str) or not name.strip():
         raise ValueError("视图名称不能为空")
+    name = name.strip()
     cleaned = _prune(_as_config(config), table, conn)
     row = conn.execute(
         'SELECT COALESCE(MAX("position"), -1) + 1,'
@@ -166,7 +197,16 @@ def create_view(
         (table, name, _encode(cleaned), position, 0 if has_default else 1),
     )
     view_id = cur.lastrowid
-    _record(conn, table, {"action": "create", "name": name, "view_id": view_id})
+    _record(
+        conn,
+        table,
+        {
+            "action": "create",
+            "name": name,
+            "view_id": view_id,
+            "config": asdict(cleaned),
+        },
+    )
     return view_id
 
 
@@ -187,9 +227,9 @@ def update_view(
             (_encode(cleaned), view_id),
         )
         return
-    name = name.strip()
-    if not name:
+    if not isinstance(name, str) or not name.strip():
         raise ValueError("视图名称不能为空")
+    name = name.strip()
     conn.execute(
         'UPDATE "__lsm_view" SET "config_json" = ?, "name" = ? WHERE "id" = ?',
         (_encode(cleaned), name, view_id),
@@ -215,7 +255,16 @@ def delete_view(conn: sqlite3.Connection, view_id: int) -> None:
     if row[5]:
         raise ValueError("默认视图不能删除")
     conn.execute('DELETE FROM "__lsm_view" WHERE "id" = ?', (view_id,))
-    _record(conn, row[1], {"action": "delete", "name": row[2], "view_id": view_id})
+    _record(
+        conn,
+        row[1],
+        {
+            "action": "delete",
+            "name": row[2],
+            "view_id": view_id,
+            "config": _payload_config(row[3]),
+        },
+    )
 
 
 def set_default(conn: sqlite3.Connection, table: str, view_id: int) -> None:

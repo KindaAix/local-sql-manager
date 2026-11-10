@@ -89,6 +89,18 @@ class TestViews(unittest.TestCase):
         with self.assertRaises(ValueError):
             create_view(self.conn, "不存在的表", "视图", ViewConfig())
 
+    def test_create_view_rejects_non_string_name(self):
+        with self.assertRaises(ValueError):
+            create_view(self.conn, "订单", 123, ViewConfig())
+
+    def test_second_view_is_not_default(self):
+        self._make_default()
+        view_id = create_view(self.conn, "订单", "本月", ViewConfig())
+        views = {v["name"]: v for v in list_views(self.conn, "订单")}
+        self.assertTrue(views["全部记录"]["is_default"])
+        self.assertFalse(views["本月"]["is_default"])
+        self.assertEqual(views["本月"]["id"], view_id)
+
     def test_config_roundtrip(self):
         config = ViewConfig(
             filters=[{"column": "状态", "op": "eq", "value": "完成"}],
@@ -173,6 +185,11 @@ class TestViews(unittest.TestCase):
         update_view(self.conn, view_id, ViewConfig(), name="全部")
         self.assertEqual(list_views(self.conn, "订单")[0]["name"], "全部")
 
+    def test_rename_rejects_non_string_name(self):
+        view_id = self._make_default()
+        with self.assertRaises(ValueError):
+            update_view(self.conn, view_id, ViewConfig(), name=123)
+
     def test_rename_rejects_empty_name(self):
         view_id = self._make_default()
         with self.assertRaises(ValueError):
@@ -201,10 +218,13 @@ class TestViews(unittest.TestCase):
             delete_view(self.conn, 99999)
 
     def test_set_default_switches_flag(self):
+        default_id = self._make_default()
         view_id = create_view(self.conn, "订单", "本月", ViewConfig())
         set_default(self.conn, "订单", view_id)
         views = {v["name"]: v for v in list_views(self.conn, "订单")}
         self.assertTrue(views["本月"]["is_default"])
+        self.assertFalse(views["全部记录"]["is_default"])
+        self.assertEqual(views["全部记录"]["id"], default_id)
 
     def test_set_default_none_view_raises(self):
         with self.assertRaises(ValueError):
@@ -216,16 +236,28 @@ class TestViews(unittest.TestCase):
         with self.assertRaises(ValueError):
             set_default(self.conn, "订单", other)
 
-    def test_create_view_is_audited(self):
-        view_id = create_view(self.conn, "订单", "本月", ViewConfig())
+    def test_create_view_is_audited_with_config(self):
+        view_id = create_view(self.conn, "订单", "本月", ViewConfig(hidden=["状态"]))
         ops = self._ops()
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0]["kind"], "view")
         self.assertEqual(ops[0]["table_name"], "订单")
-        self.assertEqual(
-            json.loads(ops[0]["payload_json"]),
-            {"action": "create", "name": "本月", "view_id": view_id},
+        payload = json.loads(ops[0]["payload_json"])
+        self.assertEqual(payload["action"], "create")
+        self.assertEqual(payload["name"], "本月")
+        self.assertEqual(payload["view_id"], view_id)
+        self.assertEqual(payload["config"]["hidden"], ["状态"])
+
+    def test_create_audit_config_can_be_replayed(self):
+        config = ViewConfig(
+            filters=[{"column": "状态", "op": "eq", "value": "完成"}],
+            sorts=[{"column": "金额", "dir": "desc"}],
+            hidden=["状态"],
+            widths={"金额": 220},
         )
+        create_view(self.conn, "订单", "本月", config)
+        payload = json.loads(self._ops()[-1]["payload_json"])
+        self.assertEqual(ViewConfig(**payload["config"]), config)
 
     def test_update_config_only_is_not_audited(self):
         view_id = self._make_default()
@@ -256,24 +288,63 @@ class TestViews(unittest.TestCase):
         update_view(self.conn, view_id, ViewConfig(), name="全部记录")
         self.assertEqual(len(self._ops()), before)
 
-    def test_delete_view_is_audited(self):
+    def test_delete_view_is_audited_with_config(self):
         self._make_default()
-        view_id = create_view(self.conn, "订单", "本月", ViewConfig())
+        view_id = create_view(
+            self.conn, "订单", "本月", ViewConfig(hidden=["状态"], widths={"金额": 200})
+        )
         before = len(self._ops())
         delete_view(self.conn, view_id)
         ops = self._ops()[before:]
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0]["kind"], "view")
-        self.assertEqual(
-            json.loads(ops[0]["payload_json"]),
-            {"action": "delete", "name": "本月", "view_id": view_id},
-        )
+        payload = json.loads(ops[0]["payload_json"])
+        self.assertEqual(payload["action"], "delete")
+        self.assertEqual(payload["name"], "本月")
+        self.assertEqual(payload["view_id"], view_id)
+        self.assertEqual(payload["config"]["hidden"], ["状态"])
+        self.assertEqual(payload["config"]["widths"], {"金额": 200})
 
     def test_set_default_is_not_audited(self):
         view_id = create_view(self.conn, "订单", "本月", ViewConfig())
         before = len(self._ops())
         set_default(self.conn, "订单", view_id)
         self.assertEqual(len(self._ops()), before)
+
+    def test_unmanaged_table_config_is_not_pruned(self):
+        self.conn.execute(
+            'CREATE TABLE "外部" ("金额" REAL)'
+        )
+        config = ViewConfig(
+            hidden=["不存在的列"],
+            widths={"不存在的列": 200},
+            filters=[{"column": "不存在的列", "op": "eq", "value": 1}],
+        )
+        view_id = create_view(self.conn, "外部", "全部记录", config)
+        self.assertEqual(load_config(self.conn, view_id), config)
+
+    def test_managed_table_without_fields_still_prunes(self):
+        create_table(self.conn, "空表", [])
+        view_id = create_view(
+            self.conn, "空表", "全部记录", ViewConfig(hidden=["不存在的列"])
+        )
+        self.assertEqual(load_config(self.conn, view_id).hidden, [])
+
+    def test_bad_config_json_falls_back_to_empty(self):
+        self.conn.execute(
+            'INSERT INTO "__lsm_view"'
+            ' ("table_name", "name", "config_json", "position", "is_default")'
+            " VALUES (?, ?, ?, 0, 1)",
+            ("订单", "损坏", "{not json"),
+        )
+        view_id = self.conn.execute(
+            'SELECT "id" FROM "__lsm_view" WHERE "name" = ?', ("损坏",)
+        ).fetchone()[0]
+        with self.assertLogs("local_sql_manager.services.views", level="WARNING"):
+            self.assertEqual(load_config(self.conn, view_id), ViewConfig())
+        with self.assertLogs("local_sql_manager.services.views", level="WARNING"):
+            views = list_views(self.conn, "订单")
+        self.assertEqual(views[0]["config"], ViewConfig())
 
     def test_writes_are_not_committed(self):
         create_view(self.conn, "订单", "本月", ViewConfig())
