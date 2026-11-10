@@ -22,6 +22,7 @@ import base64
 import json
 import sqlite3
 from contextlib import contextmanager
+from itertools import count
 from typing import Callable
 
 from . import audit, schema
@@ -33,6 +34,14 @@ from .util import utcnow_iso
 Handler = Callable[[sqlite3.Connection, dict, str], "dict | None"]
 
 _HANDLERS: dict[str, Handler] = {}
+
+# 这些 kind 不改变数据行/表本身，不应阻塞对更早操作的撤销。注意 `undo`
+# 自己也注册了处理器，但它同样不构成「后续修改」；其余豁免项一旦有处理器
+# 注册就必须从这里移除（有自检测试兜底）。
+_NON_DATA_KINDS = ("undo", "view", "create_field", "rename_field", "drop_field")
+
+# 嵌套调用时保存点重名会让内层 RELEASE 直接释放外层，加序号避免复用。
+_SAVEPOINT_SEQ = count(1)
 
 
 def register(kind: str, handler: Handler) -> None:
@@ -56,20 +65,21 @@ def _quote(name: str) -> str:
 @contextmanager
 def _txn(conn: sqlite3.Connection):
     """在保存点内执行撤销；不提交，失败时只回滚本次撤销。"""
+    name = f"lsm_undo_{next(_SAVEPOINT_SEQ)}"
     started = not conn.in_transaction
     if started:
         conn.execute("BEGIN")
-    conn.execute('SAVEPOINT "lsm_undo"')
+    conn.execute(f'SAVEPOINT "{name}"')
     try:
         yield
     except BaseException:
-        conn.execute('ROLLBACK TO "lsm_undo"')
-        conn.execute('RELEASE "lsm_undo"')
+        conn.execute(f'ROLLBACK TO "{name}"')
+        conn.execute(f'RELEASE "{name}"')
         if started:
             conn.execute("ROLLBACK")
         raise
     else:
-        conn.execute('RELEASE "lsm_undo"')
+        conn.execute(f'RELEASE "{name}"')
 
 
 def _decode(value):
@@ -241,7 +251,8 @@ def _undo_rows(conn: sqlite3.Connection, op: dict, source: str) -> dict:
     try:
         applied = _apply_diffs(conn, op["table"], _invert_rows(rows))
     except sqlite3.IntegrityError as exc:
-        raise StaleOperation(f"撤销会违反约束：{exc}") from exc
+        # 与「被别人改过」区分：这里应先处理唯一性冲突，而不是去撤销后续操作。
+        raise StaleOperation(f"撤销与唯一约束冲突：{exc}") from exc
     return {"rows": applied}
 
 
@@ -327,14 +338,16 @@ def _rename_action(conn: sqlite3.Connection, old: str, new: str) -> dict:
 
 
 def _has_later_ops(conn: sqlite3.Connection, table: str, op_id: int) -> bool:
-    """该表在 op 之后是否还有未撤销的写入。
+    """该表在 op 之后是否还有未撤销的数据写入。
 
-    undo 记录不算：撤销一条后续写入正是解除阻塞的方式。
+    undo 记录不算：撤销一条后续写入正是解除阻塞的方式；视图/字段元数据
+    操作也没有撤销处理器，若算阻塞会让撤销建表变成死路。
     """
+    placeholders = ", ".join("?" for _ in _NON_DATA_KINDS)
     row = conn.execute(
         'SELECT 1 FROM "__lsm_op" WHERE "id" > ? AND "table_name" = ?'
-        ' AND "undone_by" IS NULL AND "kind" <> ? LIMIT 1',
-        (op_id, table, "undo"),
+        f' AND "undone_by" IS NULL AND "kind" NOT IN ({placeholders}) LIMIT 1',
+        (op_id, table, *_NON_DATA_KINDS),
     ).fetchone()
     return row is not None
 
@@ -410,22 +423,23 @@ def undo(conn: sqlite3.Connection, op_id: int, source: str = "web") -> int:
 
     不可撤销、已被撤销或目标已变化时抛出异常，且不留下任何写入。
     """
-    op = audit.get_op(conn, op_id)
-    if op is None:
-        raise ValueError(f"操作不存在：{op_id}")
-    if op["irreversible"]:
-        raise Irreversible("该操作不可撤销")
-    if op["undone_by"] is not None:
-        raise StaleOperation("该操作已被撤销")
-    handler = _HANDLERS.get(op["kind"])
-    if handler is None:
-        raise StaleOperation(f"不支持撤销的操作类型：{op['kind']}")
-
+    # 路由可能把表单/URL 里的字符串 id 直接传进来。
+    op_id = _as_id(op_id)
     with _txn(conn):
+        # 在事务内读取，确保校验与写入看到的是同一份操作记录。
+        op = audit.get_op(conn, op_id)
+        if op is None:
+            raise ValueError(f"操作不存在：{op_id}")
+        if op["irreversible"]:
+            raise Irreversible("该操作不可撤销")
+        if op["undone_by"] is not None:
+            raise StaleOperation("该操作已被撤销")
+        handler = _HANDLERS.get(op["kind"])
+        if handler is None:
+            raise StaleOperation(f"不支持撤销的操作类型：{op['kind']}")
+
         extra = handler(conn, op, source) or {}
-        payload = {"op": op_id}
-        payload.update(extra)
-        payload["op"] = op_id
+        payload = {**extra, "op": op_id}
         undo_id = audit.record(conn, "undo", op["table"], source, payload)
         if audit.mark_undone(conn, op_id, undo_id) != 1:
             raise StaleOperation("该操作已被撤销")

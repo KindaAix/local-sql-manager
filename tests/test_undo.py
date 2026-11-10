@@ -169,6 +169,79 @@ class TestUndoRows(BaseUndoTestCase):
         self.assertEqual(self.cell(self.first, "金额"), 100)
         self.assertEqual(self.cell(self.first, "状态"), "完成")
 
+    def test_undo_update_keeps_earlier_delete_restore_undoable(self):
+        delete_op = soft_delete(self.conn, "订单", [self.first])
+        restore_op = restore_rows(self.conn, "订单", [self.first])
+        restored_at = self.updated_at(self.first)
+        update_op = update_cells(
+            self.conn,
+            "订单",
+            {self.first: {"金额": 500}},
+            {self.first: restored_at},
+        )
+
+        undo_service.undo(self.conn, update_op)
+        self.assertEqual(self.cell(self.first, "金额"), 100)
+        self.assertEqual(self.updated_at(self.first), restored_at)
+
+        undo_service.undo(self.conn, restore_op)
+        self.assertIsNotNone(self.row(self.first)["deleted_at"])
+
+        undo_service.undo(self.conn, delete_op)
+        self.assertIsNone(self.row(self.first)["deleted_at"])
+
+    def test_undo_batch_rolls_back_when_one_row_stale(self):
+        op = audit.record(
+            self.conn,
+            "update",
+            "订单",
+            "web",
+            {
+                "rows": [
+                    {"id": self.first, "before": {"金额": 100}, "after": {"金额": 500}},
+                    {"id": self.second, "before": {"金额": 50}, "after": {"金额": 60}},
+                ]
+            },
+        )
+        self.conn.execute(
+            'UPDATE "订单" SET "金额" = 500 WHERE "id" = ?', (self.first,)
+        )
+        self.conn.execute(
+            'UPDATE "订单" SET "金额" = 61 WHERE "id" = ?', (self.second,)
+        )
+        with self.assertRaises(StaleOperation):
+            undo_service.undo(self.conn, op)
+        self.assertEqual(self.cell(self.first, "金额"), 500)
+        self.assertEqual(self.cell(self.second, "金额"), 61)
+
+    def test_failed_undo_leaves_no_audit_rows(self):
+        op = update_cells(
+            self.conn,
+            "订单",
+            {self.first: {"金额": 500}},
+            {self.first: self.updated_at(self.first)},
+        )
+        update_cells(
+            self.conn,
+            "订单",
+            {self.first: {"金额": 600}},
+            {self.first: self.updated_at(self.first)},
+        )
+        before = self.count('SELECT COUNT(*) FROM "__lsm_op"')
+        with self.assertRaises(StaleOperation):
+            undo_service.undo(self.conn, op)
+        self.assertEqual(self.count('SELECT COUNT(*) FROM "__lsm_op"'), before)
+
+    def test_undo_accepts_string_op_id(self):
+        op = update_cells(
+            self.conn,
+            "订单",
+            {self.first: {"金额": 500}},
+            {self.first: self.updated_at(self.first)},
+        )
+        undo_service.undo(self.conn, str(op))
+        self.assertEqual(self.cell(self.first, "金额"), 100)
+
     def test_undo_update_is_stale_when_row_missing(self):
         op = update_cells(
             self.conn,
@@ -359,6 +432,27 @@ class TestUndoTables(BaseUndoTestCase):
             undo_service.undo(self.conn, op)
         self.assertIn("客户", list_tables(self.conn))
 
+    def test_undo_create_table_ignores_metadata_ops(self):
+        op = audit.record(
+            self.conn, "create_table", "客户", "web", {"name": "客户"}
+        )
+        create_table(self.conn, "客户", [ColumnSpec("名称", "text")])
+        audit.record(
+            self.conn,
+            "view",
+            "客户",
+            "web",
+            {"op": "create", "name": "全部记录", "config": {}},
+        )
+        undo_service.undo(self.conn, op)
+        self.assertNotIn("客户", list_tables(self.conn))
+        self.assertIn("客户", [item["name"] for item in list_trashed_tables(self.conn)])
+
+    def test_non_data_kinds_have_no_handlers(self):
+        # undo 自己也是处理器；其余豁免项一旦注册了处理器就必须从豁免里移除。
+        exempt = set(undo_service._NON_DATA_KINDS) - {"undo"}
+        self.assertEqual(exempt & set(undo_service._HANDLERS), set())
+
     def test_undo_rename_table_reverts_name(self):
         op = rename_table(self.conn, "订单", "发票")
         undo_service.undo(self.conn, op)
@@ -429,6 +523,36 @@ class TestUndoRegistry(BaseUndoTestCase):
 
         undo_service.undo(self.conn, undo_id)
         self.assertIn("订单", list_tables(self.conn))
+
+    def test_register_rejects_bad_arguments(self):
+        with self.assertRaises(ValueError):
+            undo_service.register("", lambda conn, op, source: None)
+        with self.assertRaises(ValueError):
+            undo_service.register(None, lambda conn, op, source: None)
+        with self.assertRaises(TypeError):
+            undo_service.register("import", "not-callable")
+
+    def test_multiple_actions_are_undone_in_reverse_order(self):
+        def handler(conn, op, source):
+            # 先 订单→发票，再 发票→单据；撤销必须倒着走，否则中间名不存在。
+            return {
+                "actions": [
+                    undo_service._rename_action(conn, "订单", "发票"),
+                    undo_service._rename_action(conn, "发票", "单据"),
+                ]
+            }
+
+        undo_service.register("merge", handler)
+        try:
+            op = audit.record(self.conn, "merge", "订单", "web", {})
+            undo_id = undo_service.undo(self.conn, op)
+        finally:
+            undo_service.unregister("merge")
+        self.assertIn("单据", list_tables(self.conn))
+
+        undo_service.undo(self.conn, undo_id)
+        self.assertIn("订单", list_tables(self.conn))
+        self.assertNotIn("单据", list_tables(self.conn))
 
     def test_registered_handler_can_be_replaced(self):
         calls = []

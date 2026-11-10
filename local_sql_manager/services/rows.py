@@ -337,11 +337,16 @@ def update_cells(
         if conflicts:
             raise ConflictError(rows=conflicts)
 
+        # updated_at 必须进前后值：撤销 update 时要把行还原到操作前的完整
+        # 状态，否则随后撤销更早的 delete/restore 会因 updated_at 不一致被判过期。
         payload_rows = [
             {
                 "id": rid,
-                "before": {column: row[column] for column in values},
-                "after": dict(values),
+                "before": {
+                    **{column: row[column] for column in values},
+                    "updated_at": row["updated_at"],
+                },
+                "after": {**values, "updated_at": now},
             }
             for rid, row, values in prepared
         ]
