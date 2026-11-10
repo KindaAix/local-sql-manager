@@ -57,6 +57,7 @@ class _Index:
     unique: bool
     origin: str
     columns: list[str]
+    column_defs: list[str]
     sql: str | None
     create_sql: str | None = None
 
@@ -86,6 +87,7 @@ class _Plan:
     checks: list[str]
     strict: bool
     row_count: int
+    sentinel_count: int
     fk_before: int
     reason: str
     by_name: dict = field(default_factory=dict)
@@ -132,12 +134,13 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def _is_managed(conn: sqlite3.Connection, table: str) -> bool:
+    """__lsm_table 里只要存在该表的任何登记行（含回收站状态）就不再采纳。"""
     if not _has_table(conn, "__lsm_table"):
         return False
     row = conn.execute(
-        'SELECT "status" FROM "__lsm_table" WHERE "table_name" = ?', (table,)
+        'SELECT 1 FROM "__lsm_table" WHERE "table_name" = ?', (table,)
     ).fetchone()
-    return row is not None and row[0] == "active"
+    return row is not None
 
 
 def _resolve(conn: sqlite3.Connection, table: str) -> tuple[str, str, str | None]:
@@ -287,16 +290,35 @@ def _check_constraints(sql: str | None) -> list[str]:
 
 
 def _plan_indexes(conn: sqlite3.Connection, table: str) -> list[_Index]:
+    """读取索引定义，保留 collation 与 DESC，供重建唯一索引时复用。"""
     indexes: list[_Index] = []
     rows = conn.execute(f"PRAGMA index_list({_quote(table)})").fetchall()
     for row in rows:
         name, unique, origin = row[1], bool(row[2]), row[3]
         if origin == "pk":
             continue
-        columns = [
-            info[2]
-            for info in conn.execute(f"PRAGMA index_info({_quote(name)})").fetchall()
-        ]
+        xinfo = conn.execute(f"PRAGMA index_xinfo({_quote(name)})").fetchall()
+        if xinfo:
+            keys = [info for info in xinfo if info[5]]
+        else:  # 极老版本没有 index_xinfo
+            keys = [
+                (info[0], info[1], info[2], 0, "BINARY", 1)
+                for info in conn.execute(
+                    f"PRAGMA index_info({_quote(name)})"
+                ).fetchall()
+            ]
+        columns = [info[2] for info in keys if info[2] is not None]
+        column_defs = []
+        for info in keys:
+            if info[2] is None:  # 表达式索引只能靠原 SQL 重放
+                continue
+            chunk = _quote(info[2])
+            collation = info[4]
+            if collation and str(collation).upper() != "BINARY":
+                chunk += f" COLLATE {_quote(collation)}"
+            if info[3]:
+                chunk += " DESC"
+            column_defs.append(chunk)
         sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)
         ).fetchone()
@@ -305,7 +327,8 @@ def _plan_indexes(conn: sqlite3.Connection, table: str) -> list[_Index]:
                 name=name,
                 unique=unique,
                 origin=origin,
-                columns=[column for column in columns if column is not None],
+                columns=columns,
+                column_defs=column_defs,
                 sql=None if sql_row is None else sql_row[0],
             )
         )
@@ -359,7 +382,7 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
     for index in indexes:
         if index.origin == "u":
             index.name = _unique_index_name(resolved, index.columns)
-            column_sql = ", ".join(_quote(column) for column in index.columns)
+            column_sql = ", ".join(index.column_defs)
             suffix = " WHERE deleted_at IS NULL" if index.unique else ""
             index.create_sql = (
                 f"CREATE {'UNIQUE ' if index.unique else ''}INDEX {_quote(index.name)}"
@@ -417,6 +440,15 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
         )
 
     row_count = conn.execute(f"SELECT COUNT(*) FROM {_quote(resolved)}").fetchone()[0]
+    sentinel_count = 0
+    if "deleted_at" not in added:
+        deleted_column = by_name["deleted_at"]
+        sentinel_count = conn.execute(
+            f"SELECT COUNT(*) FROM {_quote(resolved)}"
+            f" WHERE {_quote(deleted_column.name)} IS NOT NULL"
+            f" AND lower(trim(CAST({_quote(deleted_column.name)} AS TEXT)))"
+            " IN ('', '0', 'false', 'no', 'n')"
+        ).fetchone()[0]
     fk_before = len(conn.execute("PRAGMA foreign_key_check").fetchall())
     strict = bool(create_sql and re.search(r"\)\s*STRICT\s*$", create_sql, re.I))
 
@@ -440,6 +472,14 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
         parts.append(f"唯一索引 {names} 将改为部分索引，仅约束未删除行")
     else:
         parts.append("重建后补建各列普通索引")
+    if sentinel_count:
+        parts.append(
+            f"已有 {sentinel_count} 行 deleted_at 为空串/0，重建后视为未删除"
+        )
+    if create_sql and re.search(r"\bON\s+CONFLICT\b", create_sql, re.I):
+        parts.append(
+            "原表 UNIQUE 的 ON CONFLICT 策略无法用唯一索引表达，重建后冲突处理回到默认"
+        )
 
     checks = _check_constraints(create_sql)
     if renamed_pk:
@@ -459,6 +499,7 @@ def _prepare(conn: sqlite3.Connection, table: str) -> _Plan:
         checks=checks,
         strict=strict,
         row_count=row_count,
+        sentinel_count=sentinel_count,
         fk_before=fk_before,
         reason="；".join(parts),
         by_name=by_name,
@@ -478,7 +519,10 @@ def check_adoptable(conn: sqlite3.Connection, table: str) -> tuple[bool, str]:
 
 
 def _column_ddl(
-    column: _Column, name: str | None = None, force_nullable: bool = False
+    column: _Column,
+    name: str | None = None,
+    force_nullable: bool = False,
+    drop_default: bool = False,
 ) -> str:
     """按列定义生成 DDL；name 用于把已有附加列收敛成规范小写名。"""
     parts = [_quote(column.name if name is None else name)]
@@ -486,7 +530,7 @@ def _column_ddl(
         parts.append(column.type)
     if column.notnull and not force_nullable:
         parts.append("NOT NULL")
-    if column.default is not None:
+    if column.default is not None and not drop_default:
         parts.append(f"DEFAULT {column.default}")
     return " ".join(parts)
 
@@ -551,10 +595,23 @@ def _build_columns(plan: _Plan) -> tuple[list[str], list[str], list[str], list[A
         select_expressions.append("NULL")
     else:
         column = plan.by_name["deleted_at"]
-        # deleted_at 必须可写 NULL，否则恢复行会失败。
-        definitions.append(_column_ddl(column, "deleted_at", force_nullable=True))
+        # deleted_at 必须可写 NULL，否则恢复行会失败；原 DEFAULT 常是 ''/0
+        # 这类「未删除」哨兵，保留会让新插入的行一出生就被判为已删除。
+        definitions.append(
+            _column_ddl(
+                column,
+                "deleted_at",
+                force_nullable=True,
+                drop_default=True,
+            )
+        )
         insert_columns.append('"deleted_at"')
-        select_expressions.append(_quote(column.name))
+        select_expressions.append(
+            f'CASE WHEN {_quote(column.name)} IS NULL THEN NULL'
+            f" WHEN lower(trim(CAST({_quote(column.name)} AS TEXT)))"
+            " IN ('', '0', 'false', 'no', 'n') THEN NULL"
+            f" ELSE {_quote(column.name)} END"
+        )
 
     aux_names = set(AUX_NAMES)
     for column in plan.columns:
@@ -617,7 +674,7 @@ def _infer_field_type(conn: sqlite3.Connection, table: str, column: str) -> str:
 def _register_metadata(conn: sqlite3.Connection, plan: _Plan) -> None:
     """登记 __lsm_table / __lsm_field，并补建各业务列的普通索引。"""
     if not _has_table(conn, "__lsm_table"):
-        return
+        raise AdoptError("库缺少元数据表，无法登记为可编辑表")
     conn.execute('DELETE FROM "__lsm_table" WHERE "table_name" = ?', (plan.table,))
     conn.execute(
         'INSERT INTO "__lsm_table" ("table_name", "status", "created_at",'
@@ -663,6 +720,22 @@ def _payload(plan: _Plan) -> dict:
     }
 
 
+def _rename_table(conn: sqlite3.Connection, old: str, new: str) -> None:
+    """在 legacy_alter_table 下改表名，避免 RENAME 重解析整个 schema。
+
+    SQLite 3.25+ 的 ALTER TABLE RENAME 会重新解析库内所有对象；只要存在
+    引用旧表的 view/触发器，或一个无关的坏视图，RENAME 就会抛英文错误。
+    legacy 模式只改 schema 文本、不重写引用；这里改的是无人引用的临时表，
+    视图/触发器里的原名保持不变，改完仍指向最终表名。
+    """
+    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table={1 if legacy else 0}")
+
+
 def _rebuild(conn: sqlite3.Connection, plan: _Plan) -> None:
     old = plan.table
     definitions, insert_columns, select_expressions, params = _build_columns(plan)
@@ -689,7 +762,7 @@ def _rebuild(conn: sqlite3.Connection, plan: _Plan) -> None:
         raise AdoptError(f"重建前后行数不一致（{plan.row_count} → {copied}），已取消")
 
     conn.execute(f"DROP TABLE {_quote(old)}")
-    conn.execute(f"ALTER TABLE {_quote(TEMP_TABLE)} RENAME TO {_quote(old)}")
+    _rename_table(conn, TEMP_TABLE, old)
 
     _create_indexes(conn, plan)
     _recreate_triggers(conn, plan)
@@ -742,11 +815,22 @@ def adopt_table(conn: sqlite3.Connection, table: str, source: str = "web") -> in
             conn.execute("BEGIN")
         conn.execute('SAVEPOINT "lsm_adopt"')
         try:
-            op = audit.record(conn, "adopt", plan.table, source, _payload(plan))
+            op = audit.record(
+                conn,
+                "adopt",
+                plan.table,
+                source,
+                _payload(plan),
+                irreversible=True,
+            )
             _rebuild(conn, plan)
         except BaseException:
-            conn.execute('ROLLBACK TO "lsm_adopt"')
-            conn.execute('RELEASE "lsm_adopt"')
+            # 事务可能已被 SQLite 自动回滚，清理失败不能掩盖原始异常。
+            try:
+                conn.execute('ROLLBACK TO "lsm_adopt"')
+                conn.execute('RELEASE "lsm_adopt"')
+            except sqlite3.Error:
+                pass
             raise
         conn.execute('RELEASE "lsm_adopt"')
         if toggle_fk:

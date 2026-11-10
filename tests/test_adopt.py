@@ -6,9 +6,15 @@ from local_sql_manager.services import adopt as adopt_service
 from local_sql_manager.services.adopt import adopt_table, check_adoptable
 from local_sql_manager.services.audit import get_op, history
 from local_sql_manager.services.library import ensure_meta
-from local_sql_manager.services.models import AdoptError
-from local_sql_manager.services.rows import restore_rows, soft_delete
-from local_sql_manager.services.schema import ColumnSpec, create_table, get_fields
+from local_sql_manager.services.models import AdoptError, ViewConfig
+from local_sql_manager.services.rows import get_page, restore_rows, soft_delete
+from local_sql_manager.services.schema import (
+    ColumnSpec,
+    create_table,
+    get_fields,
+    list_tables,
+    rename_table,
+)
 
 
 class BaseAdoptTestCase(unittest.TestCase):
@@ -311,6 +317,7 @@ class TestAdoptTable(BaseAdoptTestCase):
         self.assertEqual(record["kind"], "adopt")
         self.assertEqual(record["table"], "u")
         self.assertEqual(record["source"], "web")
+        self.assertEqual(record["irreversible"], 1)
         payload = record["payload"]
         self.assertEqual(payload["name"], "u")
         self.assertEqual(
@@ -438,6 +445,176 @@ class TestAdoptTable(BaseAdoptTestCase):
         self.execute('CREATE TABLE t ("id" TEXT PRIMARY KEY)')
         with self.assertRaises(AdoptError):
             adopt_table(self.conn, "t")
+
+
+class _NoSavepointConnection:
+    """代理连接：清理阶段对 ROLLBACK TO 抛 no such savepoint。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, parameters=()):
+        if sql.strip().upper().startswith("ROLLBACK TO"):
+            raise sqlite3.OperationalError("no such savepoint")
+        return self._conn.execute(sql, parameters)
+
+
+class TestReviewFixes(BaseAdoptTestCase):
+    def test_sentinel_deleted_at_is_normalized(self):
+        self.execute(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY,"
+            " deleted_at TEXT NOT NULL DEFAULT '', v TEXT)"
+        )
+        self.execute("INSERT INTO s (id, deleted_at, v) VALUES (1, '', 'a')")
+        self.execute("INSERT INTO s (id, deleted_at, v) VALUES (2, '0', 'b')")
+        self.execute("INSERT INTO s (id, deleted_at, v) VALUES (3, 'FALSE', 'c')")
+        ok, reason = check_adoptable(self.conn, "s")
+        self.assertTrue(ok)
+        self.assertIn("3 行", reason)
+        self.assertIn("未删除", reason)
+
+        adopt_table(self.conn, "s")
+        self.assertEqual(get_page(self.conn, "s", ViewConfig()).total, 3)
+        values = [
+            row[0]
+            for row in self.execute("SELECT deleted_at FROM s").fetchall()
+        ]
+        self.assertEqual(values, [None, None, None])
+        info = {
+            row["name"]: row for row in self.execute('PRAGMA table_info("s")')
+        }
+        self.assertIsNone(info["deleted_at"]["dflt_value"])
+
+        self.execute("INSERT INTO s (v) VALUES ('d')")
+        self.assertEqual(get_page(self.conn, "s", ViewConfig()).total, 4)
+
+    def test_sentinel_integer_zero_is_normalized(self):
+        self.execute(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, deleted_at INTEGER DEFAULT 0, v TEXT)"
+        )
+        self.execute("INSERT INTO s (id, deleted_at, v) VALUES (1, 0, 'a')")
+        adopt_table(self.conn, "s")
+        self.assertIsNone(
+            self.execute("SELECT deleted_at FROM s WHERE id = 1").fetchone()[0]
+        )
+        self.assertEqual(get_page(self.conn, "s", ViewConfig()).total, 1)
+
+    def test_adopt_survives_views_and_foreign_table_triggers(self):
+        self.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        self.execute("INSERT INTO t (v) VALUES ('a')")
+        self.execute("CREATE VIEW t_view AS SELECT * FROM t")
+        self.execute("CREATE TABLE other (x TEXT)")
+        self.execute(
+            "CREATE TRIGGER other_ai AFTER INSERT ON other"
+            " BEGIN INSERT INTO t (v) VALUES (new.x); END"
+        )
+        adopt_table(self.conn, "t")
+        rows = self.execute("SELECT v FROM t_view").fetchall()
+        self.assertEqual([row[0] for row in rows], ["a"])
+        self.execute("INSERT INTO other (x) VALUES ('b')")
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM t").fetchone()[0], 2)
+        self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 0)
+
+    def test_adopt_survives_unrelated_broken_view(self):
+        self.execute("CREATE TABLE free (id INTEGER PRIMARY KEY, v TEXT)")
+        self.execute("CREATE VIEW broken AS SELECT * FROM nope")
+        adopt_table(self.conn, "free")
+        self.assertEqual(
+            self.columns("free"),
+            ["id", "created_at", "updated_at", "deleted_at", "v"],
+        )
+
+    def test_rename_helper_restores_legacy_pragma_on_failure(self):
+        self.execute("PRAGMA legacy_alter_table=1")
+        with self.assertRaises(sqlite3.OperationalError):
+            adopt_service._rename_table(self.conn, "不存在", "x")
+        self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 1)
+
+    def test_schema_rename_works_with_broken_view(self):
+        self.execute("CREATE TABLE t (a TEXT)")
+        self.execute("CREATE VIEW broken AS SELECT * FROM nope")
+        rename_table(self.conn, "t", "t2")
+        self.assertIn("t2", list_tables(self.conn))
+        self.assertEqual(self.execute("PRAGMA legacy_alter_table").fetchone()[0], 0)
+
+    def test_savepoint_cleanup_failure_does_not_mask_original_error(self):
+        self.execute("PRAGMA foreign_keys=ON")
+        self.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, v TEXT)")
+        self.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))"
+        )
+        self.conn.commit()
+        proxy = _NoSavepointConnection(self.conn)
+        with mock.patch.object(
+            adopt_service, "_create_indexes", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                adopt_table(proxy, "parent")
+        self.assertEqual(self.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+        self.assertEqual(self.columns("parent"), ["id", "v"])
+        self.assertFalse(self.table_exists(adopt_service.TEMP_TABLE))
+
+    def test_unique_collation_is_preserved(self):
+        self.execute(
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, code TEXT COLLATE NOCASE UNIQUE)"
+        )
+        adopt_table(self.conn, "u")
+        self.execute("INSERT INTO u (code) VALUES ('A')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.execute("INSERT INTO u (code) VALUES ('a')")
+
+    def test_unique_desc_is_preserved(self):
+        self.execute(
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, code TEXT, UNIQUE (code DESC))"
+        )
+        adopt_table(self.conn, "u")
+        row = self.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index'"
+            " AND name LIKE '__lsm_uniq_%'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIn("DESC", row[0])
+
+    def test_reason_mentions_on_conflict(self):
+        self.execute(
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, code TEXT UNIQUE ON CONFLICT IGNORE)"
+        )
+        ok, reason = check_adoptable(self.conn, "u")
+        self.assertTrue(ok)
+        self.assertIn("ON CONFLICT", reason)
+
+    def test_missing_metadata_rolls_back_rebuild(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ensure_meta(conn)
+        conn.execute('DROP TABLE "__lsm_table"')
+        conn.execute('CREATE TABLE legacy ("名称" TEXT)')
+        conn.execute("INSERT INTO legacy VALUES ('a')")
+        with self.assertRaises(AdoptError):
+            adopt_table(conn, "legacy")
+        cols = [row["name"] for row in conn.execute('PRAGMA table_info("legacy")')]
+        self.assertEqual(cols, ["名称"])
+        self.assertIsNone(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = ?",
+                (adopt_service.TEMP_TABLE,),
+            ).fetchone()
+        )
+        conn.close()
+
+    def test_registered_trashed_table_is_not_adoptable(self):
+        self.execute("CREATE TABLE legacy (v TEXT)")
+        self.execute(
+            'INSERT INTO "__lsm_table" ("table_name", "status", "created_at")'
+            " VALUES (?, ?, ?)",
+            ("legacy", "trashed", "2020-01-01T00:00:00Z"),
+        )
+        ok, reason = check_adoptable(self.conn, "legacy")
+        self.assertFalse(ok)
+        self.assertIn("已启用", reason)
 
 
 if __name__ == "__main__":

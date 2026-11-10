@@ -227,7 +227,15 @@ def _relocate_table(conn: sqlite3.Connection, old: str, new: str) -> None:
         )
         if row[0].startswith(_index_prefix(old))
     ]
-    conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+    # SQLite 3.25+ 的 RENAME 会重解析整个 schema；库里存在坏视图或引用旧表
+    # 的触发器时，即使与本次改名无关也会整条失败。legacy 模式只改 schema
+    # 文本、不重写引用，避免让一个坏视图挡住重命名/删表/恢复。
+    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute(f"ALTER TABLE {_quote(old)} RENAME TO {_quote(new)}")
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table={1 if legacy else 0}")
     _clear_metadata(conn, new)
     for meta in ("__lsm_table", "__lsm_field", "__lsm_view"):
         conn.execute(
