@@ -253,12 +253,15 @@ def insert_rows(
     table: str,
     rows: list[dict],
     source: str = "web",
-) -> int:
-    """插入若干行，返回 __lsm_op.id。created_at/updated_at 由服务层写入。"""
+) -> int | None:
+    """插入若干行，返回 __lsm_op.id；空批返回 None 且不记审计。"""
+    rows = list(rows or [])
+    if not rows:
+        return None
     now = utcnow_iso()
     with _write_txn(conn):
         payload_rows = []
-        for item in rows or []:
+        for item in rows:
             values = _prepare_values(conn, table, dict(item or {}))
             columns = ["created_at", "updated_at"] + list(values)
             sql = (
@@ -283,17 +286,30 @@ def update_cells(
     conn: sqlite3.Connection,
     table: str,
     changes: dict,
-    expected: dict,
+    expected: dict | None = None,
     source: str = "web",
-) -> int:
+) -> int | None:
     """按行更新若干单元格，使用 updated_at 做乐观锁。
 
-    任何一行与 expected 里的 updated_at 不一致时抛 ConflictError（携带最新行），
-    整批不做任何写入。返回 __lsm_op.id。
+    expected 传 None 表示显式关闭并发保护（仅供内部脚本）；传 dict 时必须为
+    每个参与修改的行提供 updated_at，缺失或为 None 抛 ValueError。
+    任一行版本不一致时抛 ConflictError（携带最新行），整批不做任何写入。
+    空批返回 None 且不记审计。
     """
-    requested = {_as_id(key): dict(value or {}) for key, value in (changes or {}).items()}
-    expected = {_as_id(key): value for key, value in (expected or {}).items()}
+    requested = {
+        _as_id(key): dict(value or {})
+        for key, value in (changes or {}).items()
+    }
+    # 空变更行不算参与修改，直接从批次里剔除。
+    requested = {rid: values for rid, values in requested.items() if values}
     ids = list(requested)
+    if not ids:
+        return None
+    expected_map = None
+    if expected is not None:
+        expected_map = {
+            _as_id(key): value for key, value in expected.items()
+        }
 
     if not _has_column(conn, table, "updated_at"):
         raise ValueError(f"表 {table} 没有 updated_at 列，无法启用并发保护")
@@ -305,13 +321,16 @@ def update_cells(
         conflicts = []
         for rid in ids:
             row = latest.get(rid)
-            want = expected.get(rid)
             if row is None:
                 conflicts.append({"id": rid})
                 continue
-            if want is not None and str(row["updated_at"]) != str(want):
-                conflicts.append(row)
-                continue
+            if expected_map is not None:
+                want = expected_map.get(rid)
+                if want is None:
+                    raise ValueError("缺少 updated_at 版本，无法安全写入")
+                if str(row["updated_at"]) != str(want):
+                    conflicts.append(row)
+                    continue
             values = _prepare_values(conn, table, requested[rid])
             prepared.append((rid, row, values))
 
@@ -352,11 +371,13 @@ def soft_delete(
     table: str,
     ids: list,
     source: str = "web",
-) -> int:
-    """把若干行移入回收站（写 deleted_at），返回 __lsm_op.id。"""
+) -> int | None:
+    """把若干行移入回收站（写 deleted_at）；空批或全部已在回收站返回 None。"""
     if not _has_column(conn, table, "deleted_at"):
         raise ValueError(f"表 {table} 没有 deleted_at 列，无法软删除")
     normalized = [_as_id(value) for value in ids or []]
+    if not normalized:
+        return None
     now = utcnow_iso()
     with _write_txn(conn):
         latest = _fetch_rows(conn, table, normalized)
@@ -365,6 +386,8 @@ def soft_delete(
             for rid in normalized
             if rid in latest and latest[rid]["deleted_at"] is None
         ]
+        if not targets:
+            return None
         payload_rows = [
             {
                 "id": rid,
@@ -388,14 +411,16 @@ def restore_rows(
     table: str,
     ids: list,
     source: str = "web",
-) -> int:
-    """把回收站里的行恢复（清空 deleted_at），返回 __lsm_op.id。
+) -> int | None:
+    """把回收站里的行恢复（清空 deleted_at）；空批或无命中返回 None。
 
     唯一索引冲突时抛 ValueError（提示「唯一」），整批恢复回滚。
     """
     if not _has_column(conn, table, "deleted_at"):
         raise ValueError(f"表 {table} 没有 deleted_at 列，无法恢复")
     normalized = [_as_id(value) for value in ids or []]
+    if not normalized:
+        return None
     now = utcnow_iso()
     with _write_txn(conn):
         latest = _fetch_rows(conn, table, normalized)
@@ -404,6 +429,8 @@ def restore_rows(
             for rid in normalized
             if rid in latest and latest[rid]["deleted_at"] is not None
         ]
+        if not targets:
+            return None
         payload_rows = [
             {
                 "id": rid,
@@ -433,12 +460,28 @@ def purge_rows(
     table: str,
     ids: list,
     source: str = "web",
-) -> int:
-    """彻底删除若干行，审计标记 irreversible。返回 __lsm_op.id。"""
+) -> int | None:
+    """彻底删除回收站中的行，审计标记 irreversible；空批返回 None。
+
+    只能删除已软删的行：批次里出现活跃行时整批拒绝并抛 ValueError。
+    """
+    if not _has_column(conn, table, "deleted_at"):
+        raise ValueError(f"表 {table} 没有 deleted_at 列，无法彻底删除")
     normalized = [_as_id(value) for value in ids or []]
+    if not normalized:
+        return None
     with _write_txn(conn):
         latest = _fetch_rows(conn, table, normalized)
+        active = [
+            rid
+            for rid in normalized
+            if rid in latest and latest[rid]["deleted_at"] is None
+        ]
+        if active:
+            raise ValueError("只能彻底删除回收站中的行")
         targets = [(rid, latest[rid]) for rid in normalized if rid in latest]
+        if not targets:
+            return None
         payload_rows = [
             {"id": rid, "before": dict(row), "after": None}
             for rid, row in targets

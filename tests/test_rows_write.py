@@ -147,6 +147,29 @@ class TestUpdateCells(BaseWriteTestCase):
             update_cells(self.conn, "订单", {99: {"金额": 1}}, {99: OLD_TS})
         self.assertEqual(ctx.exception.rows[0]["id"], 99)
 
+    def test_update_requires_expected_for_each_row(self):
+        with self.assertRaises(ValueError) as ctx:
+            update_cells(self.conn, "订单", {1: {"金额": 5}}, {})
+        self.assertIn("缺少 updated_at", str(ctx.exception))
+        self.assertEqual(self.cell(1, "金额"), 100)
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
+    def test_update_requires_non_null_expected(self):
+        with self.assertRaises(ValueError):
+            update_cells(self.conn, "订单", {1: {"金额": 5}}, {1: None})
+        self.assertEqual(self.cell(1, "金额"), 100)
+
+    def test_update_allows_none_expected(self):
+        op = update_cells(self.conn, "订单", {1: {"金额": 5}}, None)
+        self.assertEqual(self.cell(1, "金额"), 5)
+        self.assertEqual(self.op(op)["kind"], "update")
+
+    def test_update_does_not_commit(self):
+        update_cells(self.conn, "订单", {1: {"金额": 99}}, {1: self.updated_at(1)})
+        self.conn.rollback()
+        self.assertEqual(self.cell(1, "金额"), 100)
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
 
 class TestSoftDelete(BaseWriteTestCase):
     def test_soft_delete_is_invisible_to_page(self):
@@ -167,8 +190,14 @@ class TestSoftDelete(BaseWriteTestCase):
 
     def test_soft_delete_skips_already_deleted(self):
         soft_delete(self.conn, "订单", [1])
-        op = soft_delete(self.conn, "订单", [1])
-        self.assertEqual(self.op(op)["payload"]["rows"], [])
+        self.assertIsNone(soft_delete(self.conn, "订单", [1]))
+        self.assertEqual(len(audit.history(self.conn, "订单")), 1)
+
+    def test_soft_delete_does_not_commit(self):
+        soft_delete(self.conn, "订单", [1])
+        self.conn.rollback()
+        self.assertIsNone(self.row(1)["deleted_at"])
+        self.assertEqual(audit.history(self.conn, "订单"), [])
 
 
 class TestRestoreRows(BaseWriteTestCase):
@@ -183,8 +212,8 @@ class TestRestoreRows(BaseWriteTestCase):
         self.assertIsNone(record["payload"]["rows"][0]["after"]["deleted_at"])
 
     def test_restore_skips_rows_that_are_not_deleted(self):
-        op = restore_rows(self.conn, "订单", [1])
-        self.assertEqual(self.op(op)["payload"]["rows"], [])
+        self.assertIsNone(restore_rows(self.conn, "订单", [1]))
+        self.assertEqual(audit.history(self.conn, "订单"), [])
 
     def test_restore_reports_unique_conflict(self):
         self.conn.execute(
@@ -214,6 +243,7 @@ class TestRestoreRows(BaseWriteTestCase):
 
 class TestPurgeRows(BaseWriteTestCase):
     def test_purge_deletes_row_and_marks_irreversible(self):
+        soft_delete(self.conn, "订单", [1])
         op = purge_rows(self.conn, "订单", [1])
         self.assertIsNone(self.row(1))
         record = self.op(op)
@@ -221,15 +251,62 @@ class TestPurgeRows(BaseWriteTestCase):
         self.assertEqual(record["irreversible"], 1)
         change = record["payload"]["rows"][0]
         self.assertEqual(change["before"]["金额"], 100)
+        self.assertIsNotNone(change["before"]["deleted_at"])
         self.assertIsNone(change["after"])
 
     def test_purge_persists_after_commit(self):
+        soft_delete(self.conn, "订单", [1])
+        self.conn.commit()
         purge_rows(self.conn, "订单", [1])
         self.conn.commit()
         self.assertIsNone(self.row(1))
         self.assertEqual(
             self.conn.execute('SELECT COUNT(*) FROM "订单"').fetchone()[0], 1
         )
+
+    def test_purge_rejects_active_row(self):
+        with self.assertRaises(ValueError) as ctx:
+            purge_rows(self.conn, "订单", [1])
+        self.assertIn("回收站", str(ctx.exception))
+        self.assertIsNotNone(self.row(1))
+        self.assertIsNone(self.row(1)["deleted_at"])
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
+    def test_purge_rejects_mixed_batch(self):
+        soft_delete(self.conn, "订单", [1])
+        with self.assertRaises(ValueError):
+            purge_rows(self.conn, "订单", [1, 2])
+        self.assertIsNotNone(self.row(1))
+        self.assertIsNotNone(self.row(2))
+
+
+class TestEmptyBatches(BaseWriteTestCase):
+    def test_insert_empty_returns_none(self):
+        self.assertIsNone(insert_rows(self.conn, "订单", []))
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
+    def test_update_empty_returns_none(self):
+        self.assertIsNone(update_cells(self.conn, "订单", {}, {}))
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
+    def test_update_all_rows_empty_returns_none(self):
+        self.assertIsNone(
+            update_cells(self.conn, "订单", {1: {}}, {1: self.updated_at(1)})
+        )
+        self.assertEqual(self.cell(1, "金额"), 100)
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
+    def test_soft_delete_empty_returns_none(self):
+        self.assertIsNone(soft_delete(self.conn, "订单", []))
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
+    def test_restore_empty_returns_none(self):
+        self.assertIsNone(restore_rows(self.conn, "订单", []))
+        self.assertEqual(audit.history(self.conn, "订单"), [])
+
+    def test_purge_empty_returns_none(self):
+        self.assertIsNone(purge_rows(self.conn, "订单", []))
+        self.assertEqual(audit.history(self.conn, "订单"), [])
 
 
 if __name__ == "__main__":
