@@ -171,7 +171,9 @@ def _write_txn(conn: sqlite3.Connection):
     """
     started = not conn.in_transaction
     if started:
-        conn.execute("BEGIN")
+        # IMMEDIATE：一开始就拿写锁，避免读后写时 SHARED→RESERVED 升级
+        # 直接返回 BUSY；拿不到锁时按 busy timeout 等待。
+        conn.execute("BEGIN IMMEDIATE")
     conn.execute('SAVEPOINT "lsm_rows_write"')
     try:
         yield

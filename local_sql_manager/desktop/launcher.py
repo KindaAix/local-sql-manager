@@ -144,18 +144,21 @@ class McpHandle:
             self.thread.join(timeout=5)
 
 
-def start_mcp(library: Library, *, port: int, read_only: bool):
+def start_mcp(
+    library: Library, *, port: int, read_only: bool, token: str | None = None
+):
     """在 daemon 线程里跑 FastMCP 的 streamable-http 服务。
 
-    返回 McpHandle；依赖缺失或启动失败时记日志并返回 None，不阻断桌面壳。
+    token 交给 build_mcp，再由 ASGI 中间件校验；返回 McpHandle；依赖缺失或
+    启动失败时记日志并返回 None，不阻断桌面壳。
     """
     try:
         import uvicorn
 
-        from local_sql_manager.mcp_server import build_mcp
+        from local_sql_manager.mcp_server import build_mcp, make_http_app
 
-        mcp = build_mcp(library, read_only=read_only)
-        app = mcp.http_app(path="/mcp")
+        mcp = build_mcp(library, read_only=read_only, token=token)
+        app = make_http_app(mcp)
         # 配置端口被占用时改用系统分配的空闲端口：托盘复制出的配置会用
         # 实际端口，因此 agent 仍然连得上。
         listen_port = pick_port(port)
@@ -193,8 +196,11 @@ def start_mcp(library: Library, *, port: int, read_only: bool):
         return None
 
 
-def mcp_config_text(port=None) -> str | None:
-    """返回可直接粘贴进 MCP 客户端配置的 JSON；端口无效时返回 None。"""
+def mcp_config_text(port=None, token=None) -> str | None:
+    """返回可直接粘贴进 MCP 客户端配置的 JSON；端口无效时返回 None。
+
+    传入 token 时输出 Authorization 头，MCP 客户端会原样带上。
+    """
     if isinstance(port, bool):
         return None
     try:
@@ -203,14 +209,11 @@ def mcp_config_text(port=None) -> str | None:
         return None
     if not 0 < port <= 65535:
         return None
+    server = {"url": f"http://{HOST}:{port}/mcp"}
+    if isinstance(token, str) and token.strip():
+        server["headers"] = {"Authorization": f"Bearer {token.strip()}"}
     return json.dumps(
-        {
-            "mcpServers": {
-                "local-sql-manager": {
-                    "url": f"http://{HOST}:{port}/mcp",
-                }
-            }
-        },
+        {"mcpServers": {"local-sql-manager": server}},
         ensure_ascii=False,
         indent=2,
     )
@@ -286,9 +289,12 @@ def main() -> int:
             library,
             port=int(config["mcp_port"]),
             read_only=bool(config["mcp_read_only"]),
+            token=config["mcp_token"],
         )
         mcp_config = (
-            partial(mcp_config_text, mcp.port) if mcp is not None else None
+            partial(mcp_config_text, mcp.port, config["mcp_token"])
+            if mcp is not None
+            else None
         )
         open_browser(url)
 

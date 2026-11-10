@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from fastmcp import FastMCP
 
@@ -121,15 +123,24 @@ def _errors():
         raise ValueError(str(exc) or "该操作不可撤销") from None
     except (PermissionError, ValueError):
         raise
-    except sqlite3.Error as exc:
+    except sqlite3.OperationalError as exc:
         logger.debug("MCP 数据库错误：%r", exc)
-        raise ValueError(f"数据库错误：{exc}") from None
+        text = str(exc).lower()
+        if "locked" in text or "busy" in text:
+            raise ValueError("数据库正忙，请稍后重试") from None
+        raise ValueError("数据库错误") from None
+    except sqlite3.Error as exc:
+        # 不把 sqlite 的英文原文漏给 agent，详情只进日志。
+        logger.debug("MCP 数据库错误：%r", exc)
+        raise ValueError("数据库错误") from None
 
 
 def _require_table(conn: sqlite3.Connection, table: str) -> str:
     if not isinstance(table, str) or not table.strip():
         raise ValueError("表名必须是非空文本")
     name = table.strip()
+    if name.lower().startswith(("__lsm_", "sqlite_")):
+        raise ValueError(f"不能操作内部表：{name}")
     found = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
     ).fetchone()
@@ -164,12 +175,67 @@ def _as_config(config) -> ViewConfig:
     raise ValueError("视图配置类型不正确")
 
 
+def _default_view_config(conn: sqlite3.Connection, table: str) -> ViewConfig:
+    """表的默认视图配置；没有视图时退回空配置（与 list_views 的内存默认视图一致）。"""
+    for item in views.list_views(conn, table):
+        if item.get("is_default"):
+            return _as_config(item["config"])
+    return ViewConfig()
+
+
+def _check_filters(conn: sqlite3.Connection, table: str, filters) -> list:
+    """逐条校验筛选条件；query.build_where 对未知项是静默忽略，MCP 不能这样。"""
+    if filters is None:
+        return []
+    if not isinstance(filters, list):
+        raise ValueError("filters 必须是筛选条件列表")
+    by_name = {field.name: field for field in schema.get_fields(conn, table)}
+    checked = []
+    for item in filters:
+        if not isinstance(item, dict):
+            raise ValueError("筛选条件不支持：每一项都必须是对象")
+        column = item.get("column")
+        if not isinstance(column, str) or column not in by_name:
+            raise ValueError(f"筛选条件不支持：未知列 {column}")
+        op = item.get("op")
+        if op not in query.OPS.get(by_name[column].type, ()):
+            raise ValueError(f"筛选条件不支持：{column} 不支持操作符 {op}")
+        checked.append(item)
+    return checked
+
+
+def _as_id_list(value) -> list:
+    """行 id 列表必须是 JSON 数组；字符串会被当成逐字符迭代，必须显式拒绝。"""
+    if not isinstance(value, list):
+        raise ValueError("ids 必须是行 id 列表")
+    return [_as_id(item) for item in value]
+
+
+def _reject_deleted(conn: sqlite3.Connection, table: str, ids: list) -> None:
+    """已软删的行不能直接改写，先恢复再编辑，避免把回收站的数据改脏。"""
+    if not ids:
+        return
+    columns = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({_quote(table)})")
+    }
+    if "deleted_at" not in columns:
+        return
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(
+        f'SELECT "id" FROM {_quote(table)} WHERE "id" IN ({placeholders})'
+        ' AND "deleted_at" IS NOT NULL',
+        ids,
+    ).fetchall()
+    if rows:
+        raise ValueError("该行已删除，请先恢复")
+
+
 def _resolve_view(
     conn: sqlite3.Connection, table: str, view
 ) -> ViewConfig:
-    """view 可为 None、视图 id 或视图名称。"""
+    """view 可为 None（用默认视图）、视图 id 或视图名称。"""
     if view is None:
-        return ViewConfig()
+        return _default_view_config(conn, table)
     catalog = views.list_views(conn, table)
     wanted = None
     if isinstance(view, bool):
@@ -207,15 +273,82 @@ def _page_dict(result) -> dict:
     }
 
 
+# --- Token 鉴权 -------------------------------------------------------
+
+UNAUTHORIZED_TEXT = "未授权的 MCP 请求"
+
+
+def _header_value(scope: dict, name: bytes) -> str:
+    for key, value in scope.get("headers") or []:
+        if key.lower() == name:
+            return value.decode("latin-1")
+    return ""
+
+
+def _query_token(scope: dict) -> str:
+    raw = scope.get("query_string") or b""
+    values = parse_qs(raw.decode("latin-1")).get("token") or []
+    return values[0] if values else ""
+
+
+class TokenAuthMiddleware:
+    """ASGI 中间件：校验 Authorization: Bearer <token> 或 ?token=<token>。
+
+    放在 FastMCP 生成的 ASGI 应用外面，不改 FastMCP 内部实现；非 HTTP 的
+    lifespan 等 scope 原样透传。
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        header = _header_value(scope, b"authorization").strip()
+        supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        if not supplied:
+            supplied = _query_token(scope)
+        if not self.token or not hmac.compare_digest(supplied, self.token):
+            body = UNAUTHORIZED_TEXT.encode("utf-8")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"text/plain; charset=utf-8"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
+
+def make_http_app(mcp: FastMCP, path: str = "/mcp"):
+    """FastMCP 的 ASGI 应用；build_mcp 传了 token 时套上鉴权中间件。"""
+    app = mcp.http_app(path=path)
+    token = getattr(mcp, "lsm_token", None)
+    if token:
+        return TokenAuthMiddleware(app, token)
+    return app
+
+
 # --- FastMCP 实例与工具 -----------------------------------------------
 
 
-def build_mcp(library: Library, read_only: bool = False) -> FastMCP:
+def build_mcp(
+    library: Library, read_only: bool = False, token: str | None = None
+) -> FastMCP:
     """构造绑定到某个库的 FastMCP 实例。
 
     read_only=True 时所有写工具都抛 PermissionError，读工具照常可用。
+    token 交给 make_http_app 套成 ASGI 鉴权中间件。
     """
     mcp = FastMCP(name="local-sql-manager", instructions=INSTRUCTIONS)
+    mcp.lsm_token = token
 
     def guard() -> None:
         if read_only:
@@ -284,16 +417,19 @@ def build_mcp(library: Library, read_only: bool = False) -> FastMCP:
 
     @mcp.tool
     def count_rows(table: str, filters: list[dict] | None = None) -> int:
-        """统计未删除的行数，可按筛选条件过滤。
+        """统计未删除的行数，按默认视图的筛选叠加 filters。
 
-        filters 形如 [{"column": "金额", "op": "gt", "value": 100}]。
+        filters 形如 [{"column": "金额", "op": "gt", "value": 100}]；
+        未知列或该类型不支持的操作符直接报错，不会静默返回全表。
         """
         with _errors(), _read_conn(library) as conn:
             name = _require_table(conn, table)
-            if filters is not None and not isinstance(filters, list):
-                raise ValueError("filters 必须是筛选条件列表")
+            extra = _check_filters(conn, name, filters)
+            view = _default_view_config(conn, name)
             fields = schema.get_fields(conn, name)
-            where, params = query.build_where(filters or [], fields)
+            where, params = query.build_where(
+                list(view.filters or []) + extra, fields
+            )
             conditions = []
             columns = {
                 row[1] for row in conn.execute(f"PRAGMA table_info({_quote(name)})")
@@ -361,6 +497,7 @@ def build_mcp(library: Library, read_only: bool = False) -> FastMCP:
 
         with _errors(), _write_conn(library) as conn:
             name = _require_table(conn, table)
+            _reject_deleted(conn, name, list(mapping))
             versions = None
             if expected is None:
                 versions = _current_versions(conn, name, list(mapping))
@@ -375,18 +512,20 @@ def build_mcp(library: Library, read_only: bool = False) -> FastMCP:
     def delete_rows(table: str, ids: list[int]) -> dict:
         """把若干行移入回收站（软删），返回 {"op": 操作 id}。"""
         guard()
+        wanted = _as_id_list(ids)
         with _errors(), _write_conn(library) as conn:
             name = _require_table(conn, table)
-            op = rows_service.soft_delete(conn, name, list(ids or []), source=SOURCE)
+            op = rows_service.soft_delete(conn, name, wanted, source=SOURCE)
             return {"op": op}
 
     @mcp.tool
     def restore_rows(table: str, ids: list[int]) -> dict:
         """把回收站里的行恢复，返回 {"op": 操作 id}。"""
         guard()
+        wanted = _as_id_list(ids)
         with _errors(), _write_conn(library) as conn:
             name = _require_table(conn, table)
-            op = rows_service.restore_rows(conn, name, list(ids or []), source=SOURCE)
+            op = rows_service.restore_rows(conn, name, wanted, source=SOURCE)
             return {"op": op}
 
     @mcp.tool
@@ -398,6 +537,9 @@ def build_mcp(library: Library, read_only: bool = False) -> FastMCP:
         select 与 multiselect 的选项放在 options 里。
         """
         guard()
+        name = table.strip() if isinstance(table, str) else ""
+        if not name:
+            raise ValueError("表名不能为空")
         if not isinstance(columns, list) or not columns:
             raise ValueError("columns 必须是至少含一个字段的对象列表")
         specs = []
@@ -412,7 +554,10 @@ def build_mcp(library: Library, read_only: bool = False) -> FastMCP:
                 )
             )
         with _errors(), _write_conn(library) as conn:
-            return schema.create_table(conn, str(table).strip(), specs)
+            # 重名先自己判掉，别让 sqlite 的英文原文漏出去。
+            if schema._name_taken(conn, name):
+                raise ValueError(f"表已存在：{name}")
+            return schema.create_table(conn, name, specs)
 
     @mcp.tool
     def add_field(
@@ -459,7 +604,10 @@ def build_mcp(library: Library, read_only: bool = False) -> FastMCP:
         """按时间倒序返回操作历史，可按表名筛选；limit 上限 500。"""
         with _errors(), _read_conn(library) as conn:
             if table is not None:
-                table = _require_table(conn, table)
+                # 已删的表也要能查历史，这里只做参数校验，不校验表是否存在。
+                if not isinstance(table, str) or not table.strip():
+                    raise ValueError("表名必须是非空文本")
+                table = table.strip()
             return audit.history(conn, table, limit)
 
     @mcp.tool

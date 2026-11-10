@@ -165,6 +165,28 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg["port"], 8765)
         self.assertEqual(cfg["mcp_port"], 8766)
 
+    def test_generates_and_persists_mcp_token(self):
+        cfg = load_config()
+        token = cfg["mcp_token"]
+        self.assertGreaterEqual(len(token), 20)
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+        self.assertEqual(saved["mcp_token"], token)
+        # 第二次读取沿用同一个 token，粘贴到 MCP 客户端的配置不会失效。
+        self.assertEqual(load_config()["mcp_token"], token)
+
+    def test_existing_config_without_token_gets_one(self):
+        self._write({"port": 9000})
+        cfg = load_config()
+        self.assertTrue(cfg["mcp_token"])
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+        self.assertEqual(saved["mcp_token"], cfg["mcp_token"])
+        self.assertEqual(saved["port"], 9000)
+        self.assertEqual(load_config()["mcp_token"], cfg["mcp_token"])
+
+    def test_existing_token_is_kept(self):
+        self._write({"mcp_token": "keep-me"})
+        self.assertEqual(load_config()["mcp_token"], "keep-me")
+
     def test_string_booleans_are_explicit(self):
         self._write({"mcp_read_only": "false"})
         self.assertFalse(load_config()["mcp_read_only"])

@@ -128,6 +128,10 @@ def open_library(path: str) -> Library:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
+        # WAL：读写不互斥，读事务不会挡住写事务。rollback journal 下服务层
+        # 「先读后写」需要把 SHARED 升级成 RESERVED，这一步不走 busy handler，
+        # 并发写会立刻 database is locked。/ share.py 用 backup 接口导出，WAL 安全。
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         if _has_meta(conn):
             version = meta_version(conn)
