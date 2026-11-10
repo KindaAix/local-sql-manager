@@ -5,7 +5,7 @@
 失败不会留下半截文件，也不会破坏同名旧文件。
 
 写入前会直接删除 Excel 不支持的控制字符（不替换为空格），xlsx 与 CSV 行为
-一致；以 = 开头或形似公式的文本按纯文本写，防止公式注入。
+一致；忽略前导空白后以 = 开头或形似公式的文本按纯文本写（保留原值），防止公式注入。
 
 out_path 由调用方（路由 / MCP）负责归一化、扩展名白名单（.xlsx / .csv）与
 导出目录限制；本模块不做沙箱，只按给定路径写。
@@ -197,7 +197,7 @@ def _clean_text(text: str) -> str:
 
 
 def _cell(worksheet, value):
-    """Excel 单元格取值：bytes 转 base64；以 = 开头的文本强制按字符串写。"""
+    """Excel 单元格取值：bytes 转 base64；忽略前导空白后以 = 开头的文本强制按字符串写（保留原值）。"""
     if isinstance(value, bytes):
         value = base64.b64encode(value).decode("ascii")
     if isinstance(value, str):
@@ -210,7 +210,7 @@ def _cell(worksheet, value):
 
 
 def _csv_cell(value: object) -> str:
-    """CSV 取值：None 写空串；字符串形似公式时前置单引号防注入。
+    """CSV 取值：None 写空串；忽略前导空白后形似公式的字符串前置单引号防注入（保留原值）。
 
     数字列物理类型是 REAL，整数值按整数文本输出（-5 不写成 -5.0），
     非整数浮点保持原样。
