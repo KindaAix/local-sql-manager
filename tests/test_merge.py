@@ -24,10 +24,17 @@ def _quote(name):
 
 
 def add_table(conn, name, specs, rows):
-    """建一张受管表并写入若干行；specs 是 [(列名, 逻辑类型)]。"""
-    create_table(conn, name, [ColumnSpec(column, kind) for column, kind in specs])
+    """建一张受管表并写入若干行；specs 是 [(列名, 逻辑类型[, 选项])]。"""
+    create_table(
+        conn,
+        name,
+        [
+            ColumnSpec(spec[0], spec[1], tuple(spec[2]) if len(spec) > 2 else ())
+            for spec in specs
+        ],
+    )
     now = utcnow_iso()
-    columns = ["created_at", "updated_at"] + [column for column, _ in specs]
+    columns = ["created_at", "updated_at"] + [spec[0] for spec in specs]
     sql = (
         "INSERT INTO " + _quote(name)
         + " (" + ", ".join(_quote(column) for column in columns) + ") VALUES ("
@@ -124,6 +131,17 @@ class TestPlanMerge(MergeTestBase):
         with self.assertRaises(ValueError):
             merge.plan_merge(self.conn, ["一月", "二月"], "合计")
 
+    def test_duplicate_tables_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            merge.plan_merge(self.conn, ["一月", " 一月 "], "合计")
+        self.assertIn("源表重复", str(caught.exception))
+
+    def test_tables_must_be_a_list(self):
+        for bad in ("一月", None, 3):
+            with self.assertRaises(ValueError) as caught:
+                merge.plan_merge(self.conn, bad, "合计")
+            self.assertIn("源表必须是表名列表", str(caught.exception))
+
     def test_plan_writes_nothing(self):
         before = self.conn.execute('SELECT COUNT(*) FROM "__lsm_op"').fetchone()[0]
         merge.plan_merge(self.conn, ["一月", "二月"], "合计")
@@ -201,6 +219,57 @@ class TestMergeTables(MergeTestBase):
         self.conn.execute('CREATE TABLE "外部" ("x" TEXT)')
         with self.assertRaises(ValueError):
             merge.merge_tables(self.conn, ["外部", "一月"], "合计")
+        self.assertNotIn("合计", list_tables(self.conn))
+
+    def test_duplicate_tables_leave_no_target(self):
+        with self.assertRaises(ValueError):
+            merge.merge_tables(self.conn, ["一月", "一月"], "合计")
+        self.assertNotIn("合计", list_tables(self.conn))
+
+    def test_metadata_drift_missing_physical_column(self):
+        for (index,) in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = '一月'"
+        ).fetchall():
+            self.conn.execute(f'DROP INDEX "{index}"')
+        self.conn.execute('ALTER TABLE "一月" DROP COLUMN "备注"')
+        with self.assertRaises(ValueError) as caught:
+            merge.merge_tables(self.conn, ["一月", "二月"], "合计")
+        self.assertIn("缺少列", str(caught.exception))
+        self.assertNotIn("合计", list_tables(self.conn))
+
+    def test_options_unioned_and_conflict_reported(self):
+        self.make("甲", [("状态", "select", ("待办", "完成"))], [("待办",)])
+        self.make("乙", [("状态", "select", ("完成", "延期"))], [("延期",)])
+        plan = merge.plan_merge(self.conn, ["甲", "乙"], "合计")
+        self.assertEqual(
+            plan["conflicts"],
+            [
+                {
+                    "column": "状态",
+                    "types": {"甲": "select", "乙": "select"},
+                    "options": {"甲": ["待办", "完成"], "乙": ["完成", "延期"]},
+                }
+            ],
+        )
+        merge.merge_tables(self.conn, ["甲", "乙"], "合计")
+        fields = {field.name: field for field in get_fields(self.conn, "合计")}
+        self.assertEqual(fields["状态"].options, ("待办", "完成", "延期"))
+        self.assertEqual(self.column("合计", "状态"), ["待办", "延期"])
+
+    def test_same_options_are_not_a_conflict(self):
+        self.make("甲", [("状态", "select", ("待办", "完成"))], [("待办",)])
+        self.make("乙", [("状态", "select", ("完成", "待办"))], [("完成",)])
+        plan = merge.plan_merge(self.conn, ["甲", "乙"], "合计")
+        self.assertEqual(plan["conflicts"], [])
+        merge.merge_tables(self.conn, ["甲", "乙"], "合计")
+        fields = {field.name: field for field in get_fields(self.conn, "合计")}
+        self.assertEqual(fields["状态"].options, ("待办", "完成"))
+
+    def test_duplicate_normalized_columns_rejected(self):
+        self.make("怪表", [("金额", "number"), (" 金额 ", "number")], [(1, 2)])
+        with self.assertRaises(ValueError) as caught:
+            merge.merge_tables(self.conn, ["怪表", "一月"], "合计")
+        self.assertIn("归一化后重复", str(caught.exception))
         self.assertNotIn("合计", list_tables(self.conn))
 
     def test_no_business_columns(self):
@@ -327,6 +396,17 @@ class TestMergeMapping(MergeTestBase):
         mapping = {"金额": {"外部": "金额"}}
         with self.assertRaises(ValueError):
             merge.plan_merge(self.conn, ["中文", "英文"], "合计", mapping)
+
+    def test_empty_mapping_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            merge.plan_merge(self.conn, ["中文", "英文"], "合计", {})
+        self.assertIn("列映射不能为空", str(caught.exception))
+
+    def test_mapping_duplicate_source_table_rejected(self):
+        mapping = {"金额": {"英文": "Amount", " 英文 ": "Amount"}}
+        with self.assertRaises(ValueError) as caught:
+            merge.plan_merge(self.conn, ["中文", "英文"], "合计", mapping)
+        self.assertIn("源表重复", str(caught.exception))
 
     def test_mapping_target_type_from_first_table(self):
         self.make("文本", [("Amount", "text")], [("7",)])

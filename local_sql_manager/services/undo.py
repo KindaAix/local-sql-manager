@@ -358,6 +358,15 @@ def _has_later_ops(conn: sqlite3.Connection, table: str, op_id: int) -> bool:
     return row is not None
 
 
+def has_later_ops(conn: sqlite3.Connection, table: str, op_id: int) -> bool:
+    """该表在 op 之后是否还有未撤销的数据写入。
+
+    供合并、导入等外部撤销处理器复用同一口径：豁免的 kind 随已注册的处理器
+    动态计算，外部模块不要自己硬编码。
+    """
+    return _has_later_ops(conn, table, op_id)
+
+
 def _op_table_name(op: dict) -> str:
     payload = op["payload"]
     return payload.get("name") or payload.get("table") or op["table"]
