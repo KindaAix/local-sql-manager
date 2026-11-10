@@ -182,6 +182,28 @@ class ExportTest(unittest.TestCase):
             export_table(self.conn, "__lsm_meta", self.path())
         self.assertIn("表不存在", str(ctx.exception))
 
+    def test_leading_space_formula_is_treated_as_text(self):
+        self.insert(" =1+1", 10, "完成")
+        out = export_table(self.conn, "订单", self.path())
+        wb = load_workbook(out, read_only=True)
+        self.addCleanup(wb.close)
+        cell = next(wb["订单"].iter_rows(min_row=2, max_row=2, max_col=1))[0]
+        self.assertEqual(cell.value, " =1+1")
+        self.assertEqual(cell.data_type, "s")
+
+        csv_path = Path(self.tmp.name) / "lead.csv"
+        export_csv(self.conn, "订单", ["名称"], csv_path)
+        lines = csv_path.read_bytes().decode("utf-8-sig").split("\r\n")
+        self.assertEqual(lines[1], "' =1+1")
+
+    def test_managed_table_without_columns_raises(self):
+        create_table(self.conn, "空表", [])
+        out = self.path("空表.xlsx")
+        with self.assertRaises(ValueError) as ctx:
+            export_table(self.conn, "空表", out)
+        self.assertEqual(str(ctx.exception), "该表没有可导出的列")
+        self.assertFalse(out.exists())
+
     def test_group_orders_before_sorts(self):
         self.insert("甲", 30, "完成")
         self.insert("乙", 10, "完成")
@@ -437,13 +459,15 @@ class CsvTest(unittest.TestCase):
         self.assertEqual(data[2], ["3.14"])
 
     def test_large_integral_floats_keep_python_notation(self):
-        self.insert("大数", 1e308, "完成")
+        self.insert("极大", 1e308, "完成")
+        self.insert("超 2^53", 1e20, "完成")
         self.insert("负零", -0.0, "完成")
         data = self.read(
             export_csv(self.conn, "订单", ["金额"], Path(self.tmp.name) / "big.csv")
         )
         self.assertEqual(data[1], ["1e+308"])
-        self.assertEqual(data[2], ["0"])
+        self.assertEqual(data[2], ["1e+20"])
+        self.assertEqual(data[3], ["0"])
 
     def test_all_formula_prefixes_are_quoted(self):
         values = ("+1", "-1", "@SUM(A1)", "\t=1")

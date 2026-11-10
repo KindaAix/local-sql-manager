@@ -4,6 +4,9 @@
 流式写入，逐行从游标取数，不把整表读进内存；先写同目录临时文件再原子改名，
 失败不会留下半截文件，也不会破坏同名旧文件。
 
+写入前会直接删除 Excel 不支持的控制字符（不替换为空格），xlsx 与 CSV 行为
+一致；以 = 开头或形似公式的文本按纯文本写，防止公式注入。
+
 out_path 由调用方（路由 / MCP）负责归一化、扩展名白名单（.xlsx / .csv）与
 导出目录限制；本模块不做沙箱，只按给定路径写。
 """
@@ -78,10 +81,19 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [item[0] for item in cursor.description]
 
 
+def _is_managed(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        'SELECT 1 FROM "__lsm_table" WHERE "table_name" = ?', (table,)
+    ).fetchone()
+    return row is not None
+
+
 def _require_fields(conn: sqlite3.Connection, table: str) -> list:
     """未启用编辑（没有字段元数据）的表不允许导出，避免静默少列。"""
     fields = get_fields(conn, table)
     if not fields:
+        if _is_managed(conn, table):
+            raise ValueError("该表没有可导出的列")
         raise ValueError("该表尚未启用编辑，无法导出")
     return fields
 
@@ -180,7 +192,7 @@ def _check_row_limit(total: int) -> None:
 
 
 def _clean_text(text: str) -> str:
-    """去掉 Excel 不接受的控制字符，避免整份文件损坏。"""
+    """直接删除 Excel 不接受的控制字符（不替换为空格），避免文件损坏。"""
     return ILLEGAL_CHARACTERS_RE.sub("", text)
 
 
@@ -190,7 +202,7 @@ def _cell(worksheet, value):
         value = base64.b64encode(value).decode("ascii")
     if isinstance(value, str):
         value = _clean_text(value)
-        if value.startswith("="):
+        if value.lstrip().startswith("="):
             cell = WriteOnlyCell(worksheet, value=value)
             cell.data_type = "s"
             return cell
@@ -209,13 +221,13 @@ def _csv_cell(value: object) -> str:
         return base64.b64encode(value).decode("ascii")
     if isinstance(value, str):
         value = _clean_text(value)
-        if _CSV_FORMULA_PREFIX.match(value):
+        if _CSV_FORMULA_PREFIX.match(value.lstrip()):
             return "'" + value
         return value
     if (
         isinstance(value, float)
         and value.is_integer()
-        and abs(value) < 1e16
+        and abs(value) < 2**53
     ):
         return str(int(value))
     return str(value)
