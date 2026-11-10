@@ -84,4 +84,5 @@
   </div>
 </div>
 {% endif %}
+{% if table and not error %}<script src="{{ url_for('static', filename='js/grid.js') }}" defer></script>{% endif %}
 {% endblock %}
